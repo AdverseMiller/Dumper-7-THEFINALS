@@ -13,30 +13,6 @@ endif()
 project(Dumper-7 LANGUAGES CXX C)
 
 include(${CMAKE_SOURCE_DIR}/cmake/Common.cmake)
-include(FetchContent)
-
-# Capstone's packaging configuration assumes this is non-empty. CMake leaves it
-# unset when MinGW is selected directly instead of through a toolchain file.
-if(NOT CMAKE_SYSTEM_PROCESSOR)
-    set(CMAKE_SYSTEM_PROCESSOR x86_64)
-endif()
-
-# Discovery uses Capstone inside the DLL to evaluate protected accessors by
-# instruction semantics instead of tying recovery to one compiler byte pattern.
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-set(BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
-set(CAPSTONE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(CAPSTONE_BUILD_CSTOOL OFF CACHE BOOL "" FORCE)
-set(CAPSTONE_BUILD_CSTEST OFF CACHE BOOL "" FORCE)
-set(CAPSTONE_INSTALL OFF CACHE BOOL "" FORCE)
-set(CAPSTONE_ARCHITECTURE_DEFAULT OFF CACHE BOOL "" FORCE)
-set(CAPSTONE_X86_SUPPORT ON CACHE BOOL "" FORCE)
-FetchContent_Declare(capstone
-    GIT_REPOSITORY https://github.com/capstone-engine/capstone.git
-    GIT_TAG 5.0.7
-    GIT_SHALLOW TRUE
-)
-FetchContent_MakeAvailable(capstone)
 
 # Source files - automatic search for all source files
 file(GLOB_RECURSE CPP_SOURCES 
@@ -47,8 +23,6 @@ file(GLOB_RECURSE CPP_SOURCES
 )
 
 add_library(${PROJECT_NAME} SHARED ${CPP_SOURCES})
-
-target_link_libraries(${PROJECT_NAME} PRIVATE capstone_static)
 
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_20)
 

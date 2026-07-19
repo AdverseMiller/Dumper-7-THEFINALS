@@ -1,16 +1,16 @@
 # Discovery automation
 
-The Discovery fork bootstraps from live structure and instruction semantics. It does not use a fixed `GObjects`, `FName::AppendString`, or ProcessEvent RVA, and it does not suspend game threads.
+The Discovery fork bootstraps from live structure and instruction semantics. It does not resolve or decrypt the protected `GObjects` global, use a fixed `FName::AppendString` or ProcessEvent RVA, or suspend game threads.
 
 ## Automated recovery chain
 
 The current chain is:
 
 1. Find a likely first `FUObjectItem` allocation in committed readable memory.
-2. Recover the item stride, `UObject::InternalIndex` offset, and elements-per-chunk geometry from many consecutive live objects.
-3. Scan committed, readable executable regions for possible protected-global accessors and disassemble them with the X86-only Capstone engine embedded in the DLL.
-4. Concretely evaluate the accessor's data flow instead of requiring one byte template. The evaluator follows GPR and XMM values through memory loads, moves, XOR/OR, `pshufb`, per-lane shifts, scalar shifts/rotates, arithmetic, and byte swaps. Legacy SSE and VEX/AVX forms are supported.
-5. Observe candidate count and chunk-table results, then accept a global only when its decoded first chunk agrees with the independently discovered allocation, exactly one chunk geometry matches, and every active chunk validates structurally.
+2. Recover the item stride and `UObject::InternalIndex` offset from many consecutive live objects.
+3. Search committed writable memory for an aligned pointer equal to the first chunk. Treat each occurrence as a possible chunk table.
+4. Infer elements per chunk from `InternalIndex - slot` votes in the second chunk, with standard Unreal values retained only as fallback candidates. A candidate table is accepted only when its first entry is the independently found chunk and every consecutive chunk contains objects whose `InternalIndex` agrees with `(chunk index * elements per chunk) + slot`.
+5. Scan the final validated chunk backward and derive the enumeration limit from the highest live object whose stored `InternalIndex` matches its structural position.
 6. Recover the protected UObject address hash and slot decoder from code, then classify the Class, Outer, and Name selectors independently for all four base-slot values over thousands of objects.
 7. Locate `FName::AppendString` by executable instruction shape and require one usable implementation.
 8. Walk a live UObject vtable, resolve wrapper call targets, and accept ProcessEvent only when the dispatcher has the expected repeated function-flag accesses and native/script branch semantics.
@@ -20,18 +20,11 @@ The current chain is:
 12. Validate the complete FProperty layout before generation. Missing, overlapping, unaligned, or implausibly distant members stop the dump.
 13. Recover `FText` size from the reflected return property of `Conv_StringToText` without calling the function.
 
-All critical Discovery paths fail closed. Unsupported instructions invalidate any registers they write, and a scan that is ambiguous or cannot satisfy its independent structural checks raises an error before an old address, guessed key, or invalid layout is used. The former current-build byte-template extractor remains as a compatibility fallback; `discovery-report.json` records whether `semantic-x86-concrete-dataflow` or `current-template-fallback` was used.
-
-This semantic path covers both protected-global families observed so far:
-
-- the current 64-bit-lane XOR/rotate/shuffle accessor;
-- the documented older `pshufb -> xor -> xor -> rotl32` accessor.
-
-It does not need to recover a named Python formula before decoding. It executes the accessor's supported instruction semantics over the live encrypted bytes and constants, then validates the concrete results independently.
+All critical Discovery paths fail closed. A table, geometry, object, or index relationship that cannot satisfy its independent structural checks is rejected. There is no protected-global RVA, cipher template, disassembler, or fallback decoder in the object-array bootstrap.
 
 ## Generated artifacts
 
-Each run writes `discovery-report.json` beside the SDK. It records the recovered RVAs, transforms, selector tables, layout offsets, XOR keys, object count, and validation policy.
+Each run writes `discovery-report.json` beside the SDK. It records the structural object-array strategy, runtime table address, chunk geometry, recovered RVAs for the remaining systems, transforms, selector tables, layout offsets, XOR keys, object count, and validation policy.
 
 The generated C++ SDK is protector-aware where it needs to access UObject identity:
 
@@ -44,13 +37,15 @@ The generated C++ SDK is protector-aware where it needs to access UObject identi
 - zero-sized native structs with valid reflected members use their reflected member end as a conservative size fallback;
 - FText is emitted as opaque storage of the reflected size because its internal data-pointer layout is intentionally not actively probed.
 
+There is deliberately no generated stable `GObjects` RVA. `Offsets::GObjects` is zero and IDA mappings omit the symbol because the reconstructed chunk table is a session-specific heap allocation. Consumers that need runtime object enumeration must provide their own structural resolver or initialize the generated wrapper manually with a compatible object-array representation.
+
 The report is the authoritative record for protected reflection storage. A consumer that needs to inspect FField names or encoded FProperty members at runtime must implement the recorded decoder rather than treating those bytes as ordinary fields.
 
-## Live validation, July 18 2026
+## Validation, July 18-19 2026
 
 The current `fb7af7f2` build completed a clean live dump in about 13.8 seconds. The game process remained running throughout and after generation.
 
-Values from that run, included only as validation evidence and not as inputs, were:
+Values from that run, included only as historical validation evidence and not as inputs, were:
 
 - protected object global RVA `0x0D888A30`;
 - `FUObjectItem` stride `0x14`, index at `+0x0C`, and `0x10000` elements per chunk;
@@ -61,17 +56,27 @@ Values from that run, included only as validation evidence and not as inputs, we
 - FProperty flags/ArrayDim/ElementSize/value-offset at `+0x70/+0x78/+0x7C/+0x8C`;
 - FProperty size `0xD0` and FText size `0x18`.
 
-An independent `/proc/<pid>/mem` Python validator previously recovered the same object-global location and chunk geometry. The live DLL then recovered the remaining layers internally and generated the SDK, mappings, IDA mappings, Dumpspace, and report.
+On July 19, an independent read-only `/proc/<pid>/mem` validation exercised the replacement chain without loading a DLL:
 
-That successful run used the extracted current-family template. The first live test of the new semantic scanner terminated the game while scanning the executable image. Its scan had incorrectly treated an entire PE section as one readable buffer. The scanner now divides every executable section with `VirtualQuery` and passes Capstone only committed, readable, non-guarded region bounds. Per request, the corrected semantic build has only been compiled and statically inspected; it has not been loaded again.
+- structural discovery found first chunk `0x7E8D0008`, item stride `0x14`, and index `+0x0C`;
+- an aligned reverse-pointer scan found exactly one reference, at runtime table `0x4AE8C340`;
+- all nine consecutive chunks validated against their expected internal-index ranges;
+- the highest valid live index was `0x825F4`, producing enumeration limit `0x825F5`;
+- the table and limit exactly matched an independent decode of the protected global.
+
+The cipher-free C++ implementation builds successfully as a MinGW x64 DLL. Per request, it has not been loaded into the game.
 
 The generated CoreUObject function unit passes a MinGW C++23 syntax check with its layout assertions enabled. Compiling `Basic.cpp` together with every transitively included package still exposes unrelated stock Dumper-7 generator issues in other engine types, including missing `<cmath>` declarations, invalid reflected enum widths, and several pre-existing tail-padding assertions. Those are broader SDK-generator correctness issues, not failures in the Discovery bootstrap or protected CoreUObject decoder.
 
 ## What can still break after a rebuild
 
-This is automated, not claimed to be universally update-proof. It should survive ordinary address movement, register allocation changes, legacy-SSE versus VEX encoding changes, reordered supported operations, and changed embedded constants because the accessor is evaluated at runtime. It will intentionally stop if a rebuild changes a semantic instruction family or ABI beyond the bounded evaluator currently understood, including:
+This is automated, not claimed to be universally update-proof. It should be unaffected by changes to the protected-global RVA, cipher constants, cipher operations, compiler register allocation, or accessor implementation because none of those are read. It will intentionally stop if a rebuild changes a structural invariant beyond the bounded models currently understood, including:
 
-- a protected-global accessor that adds unsupported vector operations, helper calls, or control-flow-dependent decoding;
+- a nonstandard `FUObjectItem` organization outside the candidate stride/index ranges;
+- an unusual elements-per-chunk organization that cannot be inferred from the second chunk and is outside the fallback set;
+- a chunk table that is not present in committed writable memory or does not directly contain chunk pointers;
+- fewer than two populated chunks, which does not provide enough information to disambiguate geometry;
+- a UObject representation whose vtable no longer points into the main module;
 - a different UObject hash/slot transform family;
 - a different FField name transform family;
 - an inlined or ABI-changed `FName::AppendString`;
