@@ -1,6 +1,6 @@
 #pragma once
 
-#include <Windows.h>
+#include <windows.h>
 #include <iostream>
 #include <vector>
 #include <string>
@@ -123,10 +123,16 @@ namespace PlatformWindows
 	uintptr_t GetModuleBase(const char* const ModuleName = Settings::General::DefaultModuleName);
 	uintptr_t GetOffset(const uintptr_t Address, const char* const ModuleName = Settings::General::DefaultModuleName);
 	uintptr_t GetOffset(const void* Address, const char* const ModuleName = Settings::General::DefaultModuleName);
+	template<typename ReturnType, typename... Args>
+	uintptr_t GetOffset(ReturnType(*Address)(Args...), const char* const ModuleName = Settings::General::DefaultModuleName)
+	{
+		return GetOffset(reinterpret_cast<uintptr_t>(Address), ModuleName);
+	}
 	
 	SectionInfo GetSectionInfo(const std::string& SectionName, const char* const ModuleName = Settings::General::DefaultModuleName);
 	void* IterateSectionWithCallback(const SectionInfo& Info, const std::function<bool(void* Address)>& Callback, uint32_t Granularity = 0x4, uint32_t OffsetFromEnd = 0x0);
 	void* IterateAllSectionsWithCallback(const std::function<bool(void* Address)>& Callback, uint32_t Granularity = 0x4, uint32_t OffsetFromEnd = 0x0, const char* const ModuleName = Settings::General::DefaultModuleName);
+	void IterateMemoryRegionsWithCallback(const std::function<bool(void* Base, size_t Size)>& Callback, bool bWritableOnly = false);
 
 	bool IsAddressInAnyModule(const uintptr_t Address);
 	bool IsAddressInAnyModule(const void* Address);
@@ -195,12 +201,12 @@ namespace PlatformWindows
 	{
 		std::vector<T*> Ret;
 
-		int i = 0;
 		uintptr_t LastFoundValueAddress = StartAddress;
 		while (T* ValuePtr = FindAlignedValueInAllSections(Value, Alignment, LastFoundValueAddress, Range, ModuleName))
 		{
 			Ret.push_back(ValuePtr);
-			LastFoundValueAddress = Align(reinterpret_cast<uintptr_t>(ValuePtr) + sizeof(T), static_cast<uintptr_t>(Alignment));
+			const uintptr_t Unaligned = reinterpret_cast<uintptr_t>(ValuePtr) + sizeof(T);
+			LastFoundValueAddress = (Unaligned + Alignment - 1) & ~(static_cast<uintptr_t>(Alignment) - 1);
 		}
 
 		return Ret;

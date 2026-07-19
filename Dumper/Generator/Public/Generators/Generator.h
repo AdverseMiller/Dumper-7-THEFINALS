@@ -49,6 +49,7 @@ private:
 public:
     static void InitEngineCore();
     static void InitInternal();
+	static void WriteDiscoveryReport();
 
 private:
     static bool SetupDumperFolder();

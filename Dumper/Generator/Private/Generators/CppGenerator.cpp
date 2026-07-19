@@ -1,7 +1,9 @@
 #include <vector>
 #include <array>
+#include <algorithm>
 
 #include "Unreal/ObjectArray.h"
+#include "Unreal/Discovery.h"
 #include "Generators/CppGenerator.h"
 #include "Wrappers/MemberWrappers.h"
 #include "Managers/MemberManager.h"
@@ -448,6 +450,7 @@ std::string CppGenerator::GenerateSingleFunction(const FunctionWrapper& Func, co
 	std::string FixedFunctionName = PrefixQuotsWithBackslash(UnrealFunc.GetName());
 
 	// Function implementation generation
+	const std::string ClassExpression = Func.IsStatic() ? "StaticClass()" : Func.IsInInterface() ? (Discovery::Enabled ? "AsUObject()->GetClass()" : "AsUObject()->Class") : (Discovery::Enabled ? "GetClass()" : "Class");
 	std::string FunctionImplementation = std::format(R"(
 // {}
 // ({})
@@ -469,7 +472,7 @@ std::string CppGenerator::GenerateSingleFunction(const FunctionWrapper& Func, co
 , StructName
 , FuncInfo.FuncNameWithParams
 , bIsConstFunc ? " const" : ""
-, Func.IsStatic() ? "StaticClass()" : Func.IsInInterface() ? "AsUObject()->Class" : "Class"
+, ClassExpression
 , CppSettings::XORString ? std::format("{}(\"{}\")", CppSettings::XORString, FixedOuterName) : std::format("\"{}\"", FixedOuterName)
 , CppSettings::XORString ? std::format("{}(\"{}\")", CppSettings::XORString, FixedFunctionName) : std::format("\"{}\"", FixedFunctionName)
 , bHasParams ? ParamVarCreationString : ""
@@ -711,7 +714,7 @@ void CppGenerator::GenerateStruct(const StructWrapper& Struct, StreamType& Struc
 
 	std::string AlignmentString = "";
 
-	if (Struct.ShouldUseExplicitAlignment())
+	if (Struct.ShouldUseExplicitAlignment() || (bHasValidSuper && Struct.GetAlignment() > SuperAlignment))
 		AlignmentString = std::format("alignas(0x{:02X}) ", Struct.GetAlignment());
 	else if (bHasReusedTrailingPadding)
 		AlignmentString = std::format("SDK_ALIGN(0x{:02X}) ", Struct.GetAlignment());
@@ -2242,6 +2245,48 @@ void CppGenerator::InitPredefinedMembers()
 			},
 		};
 
+		if (Discovery::Enabled)
+		{
+			std::erase_if(FFieldClass.Properties, [](const PredefinedMember& Member) { return Member.Name == "ClassFlags"; });
+			for (PredefinedMember& Member : FFieldClass.Properties)
+			{
+				if (Member.Name == "Name")
+				{
+					Member.Type = "uint8";
+					Member.Name = "ProtectedName";
+					Member.Size = 0x10;
+					Member.ArrayDim = 0x10;
+					Member.Alignment = alignof(uint8);
+					Member.Comment = "PROTECTED STORAGE; decode parameters are in discovery-report.json";
+				}
+			}
+			for (PredefinedMember& Member : FField.Properties)
+			{
+				if (Member.Name == "Name")
+				{
+					Member.Type = "uint8";
+					Member.Name = "ProtectedName";
+					Member.Size = 0x10;
+					Member.ArrayDim = 0x10;
+					Member.Alignment = alignof(uint8);
+					Member.Comment = "PROTECTED STORAGE; decode parameters are in discovery-report.json";
+				}
+			}
+			for (PredefinedMember& Member : PropertyMembers)
+			{
+				if (Member.Name == "PropertyFlags")
+				{
+					Member.Name = "EncodedPropertyFlags";
+					Member.Comment = "PROTECTED STORAGE; XOR key is in discovery-report.json";
+				}
+				else if (Member.Name == "Offset")
+				{
+					Member.Name = "EncodedOffset";
+					Member.Comment = "PROTECTED STORAGE; decoder is in discovery-report.json";
+				}
+			}
+		}
+
 		SortMembers(FFieldClass.Properties);
 		SortMembers(FFieldVariant.Properties);
 
@@ -2461,6 +2506,113 @@ R"({{
 		},
 	};
 
+	if (Discovery::Enabled)
+	{
+		auto FormatBytes = [](const auto& Bytes)
+		{
+			std::string Result;
+			for (std::size_t Index = 0; Index < Bytes.size(); ++Index)
+			{
+				if (Index != 0)
+					Result += ", ";
+				Result += std::format("0x{:02X}", Bytes[Index]);
+			}
+			return Result;
+		};
+
+		const std::string Mask = FormatBytes(Discovery::ProtectedSlotMask);
+		const std::string Shuffle = FormatBytes(Discovery::ProtectedSlotShuffle);
+		const std::string HashBody = std::format(R"({{
+	const uintptr_t Address = reinterpret_cast<uintptr_t>(this) + 0x{:X};
+	uint32 Hash = static_cast<uint32>(Address);
+	const uint32 High = static_cast<uint32>(Address >> {});
+	Hash = std::rotl(Hash, {}) * 0x{:X}u + 0x{:X}u;
+	Hash = std::rotl(Hash, {}) * 0x{:X}u + High + 0x{:X}u;
+	Hash = std::rotl(Hash, {}) * 0x{:X}u + 0x{:X}u;
+	Hash = (Hash >> {}) * 0x{:X}u + 0x{:X}u;
+	return (Hash ^ (Hash >> {})) & 0x{:X}u;
+}})", Discovery::ProtectedAddressOffset, Discovery::ProtectedHashHighShift, Discovery::ProtectedHashRotate1, Discovery::ProtectedHashMultiplier, Discovery::ProtectedHashAddend, Discovery::ProtectedHashRotate2, Discovery::ProtectedHashMultiplier, Discovery::ProtectedHashAddend, Discovery::ProtectedHashRotate3, Discovery::ProtectedHashMultiplier, Discovery::ProtectedHashAddend, Discovery::ProtectedHashFinalShift, Discovery::ProtectedHashMultiplier, Discovery::ProtectedHashAddend, Discovery::ProtectedHashFoldShift, Discovery::ProtectedHashSlotMask);
+		const std::string DecodeBody = std::format(R"({{
+	const uint8 Mask[16] = {{ {} }};
+	const uint8 Shuffle[16] = {{ {} }};
+	const uint8* Encoded = reinterpret_cast<const uint8*>(this) + 0x{:X} + ((Slot & 0x3) * 0x{:X});
+	uint8 Mixed[16];
+	for (int32 Index = 0; Index < 16; ++Index)
+		Mixed[Index] = Encoded[Index] ^ Mask[Index];
+	uint64 Lanes[2];
+	std::memcpy(Lanes, Mixed, sizeof(Lanes));
+	for (uint64& Lane : Lanes)
+		Lane = std::rotl(Lane, {});
+	uint8 Shuffled[16];
+	const uint8* Bytes = reinterpret_cast<const uint8*>(Lanes);
+	for (int32 Index = 0; Index < 16; ++Index)
+		Shuffled[Index] = (Shuffle[Index] & 0x80) ? 0 : Bytes[Shuffle[Index] & 0x0F];
+	uint64 Result;
+	std::memcpy(&Result, Shuffled, sizeof(Result));
+	return Result;
+}})", Mask, Shuffle, Discovery::ProtectedSlotDataOffset, Discovery::ProtectedSlotStride, Discovery::ProtectedSlotRotate);
+		const std::string GetClassBody = std::format(R"({{
+	constexpr uint8 Slots[4] = {{ {}, {}, {}, {} }};
+	return reinterpret_cast<UClass*>(DecodeProtectedSlot(Slots[GetProtectedBaseSlot()]));
+}})", Discovery::ProtectedClassSlots[0], Discovery::ProtectedClassSlots[1], Discovery::ProtectedClassSlots[2], Discovery::ProtectedClassSlots[3]);
+		const std::string GetOuterBody = std::format(R"({{
+	constexpr uint8 Slots[4] = {{ {}, {}, {}, {} }};
+	return reinterpret_cast<UObject*>(DecodeProtectedSlot(Slots[GetProtectedBaseSlot()]));
+}})", Discovery::ProtectedOuterSlots[0], Discovery::ProtectedOuterSlots[1], Discovery::ProtectedOuterSlots[2], Discovery::ProtectedOuterSlots[3]);
+		const std::string GetFNameBody = std::format(R"({{
+	constexpr uint8 Slots[4] = {{ {}, {}, {}, {} }};
+	const uint64 Raw = std::rotl(DecodeProtectedSlot(Slots[GetProtectedBaseSlot()]), 32);
+	return FName(static_cast<int32>(Raw), static_cast<uint32>(Raw >> 32));
+}})", Discovery::ProtectedNameSlots[0], Discovery::ProtectedNameSlots[1], Discovery::ProtectedNameSlots[2], Discovery::ProtectedNameSlots[3]);
+
+		UObjectPredefs.Functions.insert(UObjectPredefs.Functions.end(),
+		{
+			PredefinedFunction { .CustomComment = "Decodes the protector-selected UObject slot", .ReturnType = "uint32", .NameWithParams = "GetProtectedBaseSlot()", .Body = HashBody, .bIsStatic = false, .bIsConst = true, .bIsBodyInline = true },
+			PredefinedFunction { .CustomComment = "Decodes one protected UObject storage slot", .ReturnType = "uint64", .NameWithParams = "DecodeProtectedSlot(uint32 Slot)", .Body = DecodeBody, .bIsStatic = false, .bIsConst = true, .bIsBodyInline = true },
+			PredefinedFunction { .CustomComment = "Returns the decoded UObject class", .ReturnType = "class UClass*", .NameWithParams = "GetClass()", .Body = GetClassBody, .bIsStatic = false, .bIsConst = true, .bIsBodyInline = true },
+			PredefinedFunction { .CustomComment = "Returns the decoded UObject outer", .ReturnType = "class UObject*", .NameWithParams = "GetOuter()", .Body = GetOuterBody, .bIsStatic = false, .bIsConst = true, .bIsBodyInline = true },
+			PredefinedFunction { .CustomComment = "Returns the decoded UObject name", .ReturnType = "class FName", .NameWithParams = "GetFName()", .Body = GetFNameBody, .bIsStatic = false, .bIsConst = true, .bIsBodyInline = true },
+		});
+
+		for (PredefinedFunction& Function : UObjectPredefs.Functions)
+		{
+			if (Function.NameWithParams == "GetName()")
+				Function.Body = R"({
+	return this ? GetFName().ToString() : "None";
+})";
+			else if (Function.NameWithParams == "GetFullName()")
+				Function.Body = R"({
+	if (this && GetClass())
+	{
+		std::string Temp;
+		for (UObject* NextOuter = GetOuter(); NextOuter; NextOuter = NextOuter->GetOuter())
+			Temp = NextOuter->GetName() + "." + Temp;
+		std::string Name = GetClass()->GetName();
+		Name += " ";
+		Name += Temp;
+		Name += GetName();
+		return Name;
+	}
+	return "None";
+})";
+			else if (Function.NameWithParams == "IsA(const class UClass* TypeClass)")
+				Function.Body = R"({ return GetClass()->IsSubclassOf(TypeClass); })";
+			else if (Function.NameWithParams == "IsA(const class FName& ClassName)")
+				Function.Body = R"({ return GetClass()->IsSubclassOf(ClassName); })";
+			else if (Function.NameWithParams == "IsA(EClassCastFlags TypeFlags)" || Function.NameWithParams == "HasTypeFlag(EClassCastFlags TypeFlags)")
+				Function.Body = R"({ return (GetClass()->CastFlags & TypeFlags); })";
+		}
+	}
+	else
+	{
+		UObjectPredefs.Functions.insert(UObjectPredefs.Functions.end(),
+		{
+			PredefinedFunction { .CustomComment = "Returns the UObject class", .ReturnType = "class UClass*", .NameWithParams = "GetClass()", .Body = R"({ return Class; })", .bIsStatic = false, .bIsConst = true, .bIsBodyInline = true },
+			PredefinedFunction { .CustomComment = "Returns the UObject outer", .ReturnType = "class UObject*", .NameWithParams = "GetOuter()", .Body = R"({ return Outer; })", .bIsStatic = false, .bIsConst = true, .bIsBodyInline = true },
+			PredefinedFunction { .CustomComment = "Returns the UObject name", .ReturnType = "class FName", .NameWithParams = "GetFName()", .Body = R"({ return Name; })", .bIsStatic = false, .bIsConst = true, .bIsBodyInline = true },
+		});
+	}
+
 	UEClass Struct = ObjectArray::FindClassFast("Struct");
 
 	const int32 UStructIdx = Struct ? Struct.GetIndex() : ObjectArray::FindClassFast("struct").GetIndex(); // misspelled on some UE versions.
@@ -2509,7 +2661,7 @@ R"({
 
 	for (const UStruct* Struct = this; Struct; Struct = Struct->SuperStruct)
 	{
-		if (Struct->Name == BaseClassName)
+		if (Struct->GetFName() == BaseClassName)
 			return true;
 	}
 
@@ -3449,10 +3601,12 @@ void CppGenerator::GenerateBasicFiles(StreamType& BasicHpp, StreamType& BasicCpp
 #include <functional>
 #include <type_traits>
 #include <format>
+#include <bit>
+#include <cstring>
 )", (!Settings::Config::SDKNamespaceName.empty() ? SDKMacroDefinitions : ""));
 
 	WriteFileHead(BasicHpp, nullptr, EFileType::BasicHpp, "Basic file containing structs required by the SDK", CustomIncludes);
-	WriteFileHead(BasicCpp, nullptr, EFileType::BasicCpp, "Basic file containing function-implementations from Basic.hpp", "#include <Windows.h>");
+	WriteFileHead(BasicCpp, nullptr, EFileType::BasicCpp, "Basic file containing function-implementations from Basic.hpp", "#include <windows.h>");
 
 
 	/* use namespace of UnrealContainers */
@@ -3486,12 +3640,12 @@ namespace Offsets
 	constexpr int32 ProcessEvent      = 0x{:08X};
 	constexpr int32 ProcessEventIdx   = 0x{:08X};
 }}
-)", max(Off::InSDK::ObjArray::GObjects, 0x0),
-	max(Off::InSDK::Name::AppendNameToString, 0x0),
+)", std::max(Off::InSDK::ObjArray::GObjects, 0x0),
+	std::max(Off::InSDK::Name::AppendNameToString, 0x0),
 	GetNameEntryFromNameOffsetText,
-	max(Off::InSDK::NameArray::GNames, 0x0),
-	max(Off::InSDK::World::GWorld, 0x0),
-	max(Off::InSDK::ProcessEvent::PEOffset, 0x0),
+	std::max(Off::InSDK::NameArray::GNames, 0x0),
+	std::max(Off::InSDK::World::GWorld, 0x0),
+	std::max(Off::InSDK::ProcessEvent::PEOffset, 0x0),
 	Off::InSDK::ProcessEvent::PEIndex);
 
 
@@ -3582,7 +3736,10 @@ int32 BasicFilesImplUtils::GetObjectIndex(class UClass* Class)
 
 uint64 BasicFilesImplUtils::GetObjFNameAsUInt64(class UClass* Class)
 {
-	return *reinterpret_cast<uint64*>(&Class->Name);
+	const FName Name = Class->GetFName();
+	uint64 Raw;
+	std::memcpy(&Raw, &Name, sizeof(Raw));
+	return Raw;
 }
 
 class UObject* BasicFilesImplUtils::GetObjectByIndex(int32 Index)
@@ -3599,7 +3756,7 @@ UFunction* BasicFilesImplUtils::FindFunctionByFName(const FName* Name)
 		if (!Object)
 			continue;
 
-		if (Object->Name == *Name)
+		if (Object->GetFName() == *Name)
 			return static_cast<UFunction*>(Object);
 	}
 
@@ -4788,7 +4945,7 @@ namespace FTextImpl
 
 	/* class FText */
 	PredefinedStruct FText = PredefinedStruct{
-		.UniqueName = "FText", .Size = Off::InSDK::Text::TextSize, .Alignment = sizeof(void*), .bUseExplictAlignment = false, .bIsFinal = true, .bIsClass = true, .bIsUnion = false, .Super = nullptr
+		.UniqueName = "FText", .Size = Off::InSDK::Text::TextSize, .Alignment = sizeof(void*), .bUseExplictAlignment = Discovery::Enabled, .bIsFinal = true, .bIsClass = true, .bIsUnion = false, .Super = nullptr
 	};
 
 	FText.Properties =
@@ -4819,6 +4976,26 @@ R"({
 			.bIsStatic = false, .bIsConst = true, .bIsBodyInline = true
 		},
 	};
+
+	if (Discovery::Enabled)
+	{
+		FText.Properties =
+		{
+			PredefinedMember {
+				.Comment = "OPAQUE STORAGE; only the reflected size was recovered without calling game code",
+				.Type = "uint8", .Name = "OpaqueData", .Offset = 0x0, .Size = Off::InSDK::Text::TextSize, .ArrayDim = Off::InSDK::Text::TextSize, .Alignment = alignof(uint8),
+				.bIsStatic = false, .bIsZeroSizeMember = false, .bIsBitField = false, .BitIndex = 0xFF
+			},
+		};
+		FText.Functions =
+		{
+			PredefinedFunction {
+				.CustomComment = "FText internals were intentionally not actively probed",
+				.ReturnType = "std::string", .NameWithParams = "ToString()", .Body = R"({ return "<opaque FText>"; })",
+				.bIsStatic = false, .bIsConst = true, .bIsBodyInline = true
+			},
+		};
+	}
 
 	GenerateStruct(&FText, BasicHpp, BasicCpp, BasicHpp, AssertionsFile);
 
@@ -5918,7 +6095,7 @@ struct std::formatter<T*> : std::formatter<std::string>
 {{
 	auto format(T* Object, std::format_context& Context) const
 	{{
-		const std::string ClassName = Object && Object->Class ? Object->Class->GetName() : T::StaticClass()->GetName();
+			const std::string ClassName = Object && Object->GetClass() ? Object->GetClass()->GetName() : T::StaticClass()->GetName();
 		if (Object)
 		{{
 			return std::formatter<std::string>::format(std::format("{{}}(0x{{:X}}, {{}})", ClassName, reinterpret_cast<uintptr_t>(Object), Object->GetName()), Context);
@@ -6198,7 +6375,7 @@ namespace UC
 	class TArray
 	{
 	private:
-		template<typename ArrayElementType>
+		template<typename AllocatedElementType>
 		friend class TAllocatedArray;
 
 		template<typename SparseArrayElementType>

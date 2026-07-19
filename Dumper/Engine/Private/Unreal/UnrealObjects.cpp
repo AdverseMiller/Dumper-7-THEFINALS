@@ -3,6 +3,49 @@
 #include "Unreal/UnrealObjects.h"
 #include "Unreal/ObjectArray.h"
 #include "OffsetFinder/Offsets.h"
+#include "Unreal/Discovery.h"
+
+namespace
+{
+	const char* GetDiscoveryFieldClassName(const EClassCastFlags Flags)
+	{
+		if (Flags & EClassCastFlags::VCellProperty) return "VCellProperty";
+		if (Flags & EClassCastFlags::AnsiStrProperty) return "AnsiStrProperty";
+		if (Flags & EClassCastFlags::Utf8StrProperty) return "Utf8StrProperty";
+		if (Flags & EClassCastFlags::OptionalProperty) return "OptionalProperty";
+		if (Flags & EClassCastFlags::FieldPathProperty) return "FieldPathProperty";
+		if (Flags & EClassCastFlags::MulticastSparseDelegateProperty) return "MulticastSparseDelegateProperty";
+		if (Flags & EClassCastFlags::MulticastInlineDelegateProperty) return "MulticastInlineDelegateProperty";
+		if (Flags & EClassCastFlags::EnumProperty) return "EnumProperty";
+		if (Flags & EClassCastFlags::SetProperty) return "SetProperty";
+		if (Flags & EClassCastFlags::MapProperty) return "MapProperty";
+		if (Flags & EClassCastFlags::SoftClassProperty) return "SoftClassProperty";
+		if (Flags & EClassCastFlags::DoubleProperty) return "DoubleProperty";
+		if (Flags & EClassCastFlags::Int16Property) return "Int16Property";
+		if (Flags & EClassCastFlags::TextProperty) return "TextProperty";
+		if (Flags & EClassCastFlags::SoftObjectProperty) return "SoftObjectProperty";
+		if (Flags & EClassCastFlags::LazyObjectProperty) return "LazyObjectProperty";
+		if (Flags & EClassCastFlags::WeakObjectProperty) return "WeakObjectProperty";
+		if (Flags & EClassCastFlags::ClassProperty) return "ClassProperty";
+		if (Flags & EClassCastFlags::ObjectProperty) return "ObjectProperty";
+		if (Flags & EClassCastFlags::InterfaceProperty) return "InterfaceProperty";
+		if (Flags & EClassCastFlags::DelegateProperty) return "DelegateProperty";
+		if (Flags & EClassCastFlags::ArrayProperty) return "ArrayProperty";
+		if (Flags & EClassCastFlags::StructProperty) return "StructProperty";
+		if (Flags & EClassCastFlags::BoolProperty) return "BoolProperty";
+		if (Flags & EClassCastFlags::UInt16Property) return "UInt16Property";
+		if (Flags & EClassCastFlags::StrProperty) return "StrProperty";
+		if (Flags & EClassCastFlags::NameProperty) return "NameProperty";
+		if (Flags & EClassCastFlags::UInt32Property) return "UInt32Property";
+		if (Flags & EClassCastFlags::UInt64Property) return "UInt64Property";
+		if (Flags & EClassCastFlags::FloatProperty) return "FloatProperty";
+		if (Flags & EClassCastFlags::Int64Property) return "Int64Property";
+		if (Flags & EClassCastFlags::IntProperty) return "IntProperty";
+		if (Flags & EClassCastFlags::Int8Property) return "Int8Property";
+		if (Flags & EClassCastFlags::ByteProperty) return "ByteProperty";
+		return "Property";
+	}
+}
 
 
 void* UEFFieldClass::GetAddress()
@@ -27,6 +70,9 @@ EClassCastFlags UEFFieldClass::GetCastFlags() const
 
 EClassFlags UEFFieldClass::GetClassFlags() const
 {
+	if (Discovery::Enabled)
+		return EClassFlags::None;
+
 	return *reinterpret_cast<EClassFlags*>(Class + Off::FFieldClass::ClassFlags);
 }
 
@@ -37,6 +83,9 @@ UEFFieldClass UEFFieldClass::GetSuper() const
 
 FName UEFFieldClass::GetFName() const
 {
+	if constexpr (Discovery::Enabled)
+		return FName(Discovery::GetFieldName(Class));
+
 	return FName(Class + Off::FFieldClass::Name); //Not the real FName, but a wrapper which holds the address of a FName
 }
 
@@ -47,11 +96,17 @@ bool UEFFieldClass::IsType(EClassCastFlags Flags) const
 
 std::string UEFFieldClass::GetName() const
 {
+	if (Discovery::Enabled && Class)
+		return GetDiscoveryFieldClassName(GetCastFlags());
+
 	return Class ? GetFName().ToString() : "None";
 }
 
 std::string UEFFieldClass::GetValidName() const
 {
+	if (Discovery::Enabled && Class)
+		return GetDiscoveryFieldClassName(GetCastFlags());
+
 	return Class ? GetFName().ToValidString() : "None";
 }
 
@@ -111,6 +166,9 @@ UEFFieldClass UEFField::GetClass() const
 
 FName UEFField::GetFName() const
 {
+	if (Discovery::Enabled)
+		return FName(Discovery::GetFieldName(Field));
+
 	return FName(Field + Off::FField::Name); //Not the real FName, but a wrapper which holds the address of a FName
 }
 
@@ -261,16 +319,25 @@ int32 UEObject::GetIndex() const
 
 UEClass UEObject::GetClass() const
 {
+	if (Discovery::Enabled)
+		return UEClass(Discovery::GetClass(Object));
+
 	return UEClass(*reinterpret_cast<void**>(Object + Off::UObject::Class));
 }
 
 FName UEObject::GetFName() const
 {
+	if (Discovery::Enabled)
+		return FName(Discovery::GetName(Object));
+
 	return FName(Object + Off::UObject::Name); //Not the real FName, but a wrapper which holds the address of a FName
 }
 
 UEObject UEObject::GetOuter() const
 {
+	if (Discovery::Enabled)
+		return UEObject(Discovery::GetOuter(Object));
+
 	return UEObject(*reinterpret_cast<void**>(Object + Off::UObject::Outer));
 }
 
@@ -434,6 +501,9 @@ std::string UEObject::GetPathName() const
 
 UEObject::operator bool() const
 {
+	if (Discovery::Enabled)
+		return Object != nullptr;
+
 	// if an object is 0x10000F000 it passes the nullptr check
 	return Object != nullptr && reinterpret_cast<void*>(Object + Off::UObject::Class) != nullptr;
 }
@@ -801,6 +871,9 @@ UEFunction UEClass::GetFunction(const std::string& ClassName, const std::string&
 
 EFunctionFlags UEFunction::GetFunctionFlags() const
 {
+	if (Discovery::Enabled)
+		return static_cast<EFunctionFlags>(*reinterpret_cast<const uint32*>(Object + Off::UFunction::FunctionFlags) ^ Discovery::FunctionFlagsXorKey);
+
 	return *reinterpret_cast<EFunctionFlags*>(Object + Off::UFunction::FunctionFlags);
 }
 
@@ -879,6 +952,9 @@ FName UEProperty::GetFName() const
 {
 	if (Settings::Internal::bUseFProperty)
 	{
+		if (Discovery::Enabled)
+			return FName(Discovery::GetFieldName(Base));
+
 		return FName(Base + Off::FField::Name); //Not the real FName, but a wrapper which holds the address of a FName
 	}
 
@@ -900,12 +976,19 @@ int32 UEProperty::GetSize() const
 
 int32 UEProperty::GetOffset() const
 {
+	if (Discovery::Enabled)
+		return static_cast<int32>(_byteswap_ulong(*reinterpret_cast<const uint32*>(Base + Off::Property::Offset_Internal) ^ Discovery::PropertyOffsetXorKey));
+
 	return *reinterpret_cast<int32*>(Base + Off::Property::Offset_Internal);
 }
 
 EPropertyFlags UEProperty::GetPropertyFlags() const
 {
-	return *reinterpret_cast<EPropertyFlags*>(Base + Off::Property::PropertyFlags);
+	const EPropertyFlags Flags = *reinterpret_cast<EPropertyFlags*>(Base + Off::Property::PropertyFlags);
+	if (Discovery::Enabled)
+		return static_cast<EPropertyFlags>(static_cast<uint64_t>(Flags) ^ Discovery::PropertyFlagsXorKey);
+
+	return Flags;
 }
 
 bool UEProperty::HasPropertyFlags(EPropertyFlags PropertyFlag) const

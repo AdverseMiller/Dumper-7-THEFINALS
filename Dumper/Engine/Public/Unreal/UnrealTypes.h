@@ -3,7 +3,7 @@
 #include <array>
 #include <string>
 #include <iostream>
-#include <Windows.h>
+#include <windows.h>
 
 #include "Unreal/Enums.h"
 #include "OffsetFinder/Offsets.h"
@@ -90,17 +90,23 @@ private:
 
 private:
 	const uint8* Address;
+	uint64 InlineValue = 0;
+	bool bOwnsInlineValue = false;
 
 public:
 	FName() = default;
 
 	FName(const void* Ptr);
+	FName(uint64 Value);
+	FName(const FName& Other);
+	FName& operator=(const FName& Other);
 
 public:
 	static void Init_Windows(bool bForceGNames = false);
 	static void InitFallback();
 
 	static void Init(int32 OverrideOffset, EOffsetOverrideType OverrideType = EOffsetOverrideType::AppendString, bool bIsNamePool = false, const char* const ModuleName = Settings::General::DefaultModuleName);
+	static void InitDiscovery(const char* const ModuleName = Settings::General::DefaultModuleName);
 
 private:
 	static void* TryFindApendStringBackupStringRef_Windows();

@@ -7,7 +7,7 @@ SDK Generator for all Unreal Engine games. Supported versions are all of UE4 and
 
 - Compile the dll in x64-Release
 - Inject the dll into your target game
-- The SDK is generated into the path specified by `Settings::SDKGenerationPath`, by default this is `C:\\Dumper-7`
+- The SDK is generated into the path specified by `Settings::SDKGenerationPath`. This Discovery fork defaults to `Z:\\mnt\\SteamLibrary\\Dumper-7\\Discovery` under Wine (`/mnt/SteamLibrary/Dumper-7/Discovery` on the Linux host).
 - **See [UsingTheSDK](UsingTheSDK.md) for a guide to get started, or to migrate from an old SDK.**
 ## Support Me
 
@@ -72,7 +72,7 @@ USDT (Tron (TRC20)): `TWHDoUr2H52Gb2WYdZe7z1Ct316gMg64ps`
 ## Config File
 You can optionally dynamically change settings through a `Dumper-7.ini` file, instead of modifying `Settings.h`.
 - **Per-game**: Create `Dumper-7.ini` in the same directory as the game's exe file.
-- **Global**: Create `Dumper-7.ini` under `C:\Dumper-7`.
+- **Global**: Create `Dumper-7.ini` under `Z:\mnt\SteamLibrary\Dumper-7\Discovery`.
 - Profiles do not merge. In other words your global profile does not change the default settings.
   
 - **SleepTimeout:**
@@ -86,7 +86,7 @@ You can optionally dynamically change settings through a `Dumper-7.ini` file, in
 - **SDKNamespaceName:**
   - Changes the namespace in the generated files.
 - **SDKGenerationPath:**
-  - Generate output at the specified path instead of `C:/Dumper-7`.
+  - Generate output at the specified path instead of `Z:/mnt/SteamLibrary/Dumper-7/Discovery`.
   - Paths are relative to game executable unless you use an absolute path including drive letter.
   - Use `..` to access parent directories. Do not include quotes.
 

@@ -42,6 +42,7 @@ namespace Off
 			inline int32 PEOffset;
 
 			void InitPE_Windows();
+			void InitDiscoveryPE_Windows();
 			void InitPE(const int32 Index, const char* const ModuleName = Settings::General::DefaultModuleName);
 		}
 

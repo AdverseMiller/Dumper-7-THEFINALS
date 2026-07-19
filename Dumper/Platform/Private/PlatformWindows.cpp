@@ -467,6 +467,44 @@ void* PlatformWindows::IterateAllSectionsWithCallback(const std::function<bool(v
 	return Result;
 }
 
+void PlatformWindows::IterateMemoryRegionsWithCallback(const std::function<bool(void* Base, size_t Size)>& Callback, bool bWritableOnly)
+{
+	SYSTEM_INFO SystemInfo;
+	GetSystemInfo(&SystemInfo);
+
+	const uintptr_t MaximumAddress = reinterpret_cast<uintptr_t>(SystemInfo.lpMaximumApplicationAddress);
+	uintptr_t CurrentAddress = reinterpret_cast<uintptr_t>(SystemInfo.lpMinimumApplicationAddress);
+
+	while (CurrentAddress < MaximumAddress)
+	{
+		MEMORY_BASIC_INFORMATION MemoryInfo;
+		if (!VirtualQuery(reinterpret_cast<void*>(CurrentAddress), &MemoryInfo, sizeof(MemoryInfo)))
+		{
+			CurrentAddress += 0x1000;
+			continue;
+		}
+
+		constexpr DWORD ReadableMask = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+		constexpr DWORD WritableMask = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+		constexpr DWORD InaccessibleMask = PAGE_GUARD | PAGE_NOACCESS;
+
+		const bool bReadable = (MemoryInfo.Protect & ReadableMask) && !(MemoryInfo.Protect & InaccessibleMask);
+		const bool bWritable = MemoryInfo.Protect & WritableMask;
+		if (MemoryInfo.State == MEM_COMMIT && bReadable && (!bWritableOnly || bWritable))
+		{
+			if (Callback(MemoryInfo.BaseAddress, MemoryInfo.RegionSize))
+				return;
+		}
+
+		const uintptr_t RegionBase = reinterpret_cast<uintptr_t>(MemoryInfo.BaseAddress);
+		const uintptr_t NextAddress = RegionBase + MemoryInfo.RegionSize;
+		if (NextAddress <= CurrentAddress)
+			return;
+
+		CurrentAddress = NextAddress;
+	}
+}
+
 
 bool PlatformWindows::IsAddressInAnyModule(const uintptr_t Address)
 {
