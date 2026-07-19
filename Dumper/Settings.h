@@ -15,7 +15,10 @@ namespace Settings
 		constexpr const char* DefaultModuleName = nullptr;
 	}
   
-	inline constexpr const char* GlobalConfigPath = "C:/Dumper-7/Dumper-7.ini";
+	/* Wine exposes the Linux filesystem through Z:. Keep generated data out of
+	 * the game's Proton prefix so prefix maintenance does not mix with dumps. */
+	inline constexpr const char* DefaultOutputPath = "Z:/mnt/SteamLibrary/Dumper-7/Discovery";
+	inline constexpr const char* GlobalConfigPath = "Z:/mnt/SteamLibrary/Dumper-7/Discovery/Dumper-7.ini";
 
 	namespace Config
 	{
@@ -39,10 +42,10 @@ namespace Settings
 	namespace Generator
 	{
 		/* Auto generated if no override is provided */
-		inline std::string GameName = "";
-		inline std::string GameVersion = "";
+		inline std::string GameName = "Discovery";
+		inline std::string GameVersion = "fb7af7f2";
 
-		inline std::string SDKGenerationPath = "C:/Dumper-7";
+		inline std::string SDKGenerationPath = DefaultOutputPath;
 
 		/* Whether to use a timestamp suffix for backup folders instead of "_OLD", allowing unlimited backups */
 		inline bool bCreateUniqueBackups = false;

@@ -1,8 +1,15 @@
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <set>
+#include <tuple>
 #include <vector>
 #include <random>
+#include <format>
 
 #include "OffsetFinder/OffsetFinder.h"
 #include "Unreal/ObjectArray.h"
+#include "Unreal/Discovery.h"
 
 #include "Platform.h"
 
@@ -304,6 +311,269 @@ void OffsetFinder::FixupHardcodedOffsets()
 	}
 }
 
+void OffsetFinder::InitDiscoveryFFieldLayout()
+{
+	const std::uintptr_t ModuleBase = Platform::GetModuleBase(Settings::General::DefaultModuleName);
+	const auto* DosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(ModuleBase);
+	if (!ModuleBase || Platform::IsBadReadPtr(DosHeader) || DosHeader->e_magic != IMAGE_DOS_SIGNATURE)
+		throw std::runtime_error("Discovery FField scan could not read the main module");
+
+	const auto* NtHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(ModuleBase + DosHeader->e_lfanew);
+	if (Platform::IsBadReadPtr(NtHeaders) || NtHeaders->Signature != IMAGE_NT_SIGNATURE)
+		throw std::runtime_error("Discovery FField scan found an invalid NT header");
+
+	const std::uintptr_t ModuleEnd = ModuleBase + NtHeaders->OptionalHeader.SizeOfImage;
+	struct Decoder
+	{
+		std::uint32_t NameOffset;
+		std::uint32_t WordRotate;
+		std::uint32_t ResultRotate;
+		std::uint64_t XorKey;
+		std::array<std::uint8_t, 8> Shuffle;
+
+		bool operator<(const Decoder& Other) const
+		{
+			return std::tie(NameOffset, WordRotate, ResultRotate, XorKey, Shuffle) < std::tie(Other.NameOffset, Other.WordRotate, Other.ResultRotate, Other.XorKey, Other.Shuffle);
+		}
+	};
+
+	std::set<Decoder> Decoders;
+	std::vector<std::pair<const std::uint8_t*, std::size_t>> ReadableRanges;
+	const auto* Section = IMAGE_FIRST_SECTION(NtHeaders);
+	for (std::uint16_t SectionIndex = 0; SectionIndex < NtHeaders->FileHeader.NumberOfSections; ++SectionIndex, ++Section)
+	{
+		if (!(Section->Characteristics & IMAGE_SCN_MEM_EXECUTE))
+			continue;
+
+		const auto* SectionBegin = reinterpret_cast<const std::uint8_t*>(ModuleBase + Section->VirtualAddress);
+		const auto* SectionEnd = SectionBegin + std::min<std::size_t>(Section->Misc.VirtualSize, ModuleEnd - reinterpret_cast<std::uintptr_t>(SectionBegin));
+		for (const std::uint8_t* Cursor = SectionBegin; Cursor < SectionEnd;)
+		{
+			MEMORY_BASIC_INFORMATION MemoryInfo{};
+			if (!VirtualQuery(Cursor, &MemoryInfo, sizeof(MemoryInfo)))
+				break;
+			const auto* RegionEnd = std::min(SectionEnd, reinterpret_cast<const std::uint8_t*>(MemoryInfo.BaseAddress) + MemoryInfo.RegionSize);
+			if (RegionEnd <= Cursor)
+				break;
+
+			constexpr DWORD ReadableMask = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+			constexpr DWORD InaccessibleMask = PAGE_GUARD | PAGE_NOACCESS;
+			if (MemoryInfo.State == MEM_COMMIT && (MemoryInfo.Protect & ReadableMask) && !(MemoryInfo.Protect & InaccessibleMask))
+			{
+				const std::size_t RegionSize = static_cast<std::size_t>(RegionEnd - Cursor);
+				if (!ReadableRanges.empty() && ReadableRanges.back().first + ReadableRanges.back().second == Cursor)
+					ReadableRanges.back().second += RegionSize;
+				else if (RegionSize >= 0x100)
+					ReadableRanges.emplace_back(Cursor, RegionSize);
+			}
+			Cursor = RegionEnd;
+		}
+	}
+
+	std::size_t DecoderImplementationMatches = 0;
+	std::size_t DecoderNameMatches = 0;
+	std::size_t DecoderControlMatches = 0;
+	std::size_t DecoderKeyMatches = 0;
+	for (const auto& [Begin, Size] : ReadableRanges)
+	{
+		static constexpr std::uint8_t FinishDecode[] = { 0x66, 0x48, 0x0F, 0x7E, 0xC0, 0x48, 0x31, 0xD8, 0x48, 0xC1, 0xC0 };
+		for (std::size_t Offset = 0x80; Offset + 0x40 < Size; ++Offset)
+		{
+			const auto* Rotate = Begin + Offset;
+			if (std::memcmp(Rotate, "\x66\x0F\x71\xD1", 4) != 0 || std::memcmp(Rotate + 5, "\x66\x0F\x71\xF0", 4) != 0 || std::memcmp(Rotate + 10, "\x66\x0F\xEB\xC1", 4) != 0 || Rotate[4] + Rotate[9] != 16 || std::memcmp(Rotate + 14, FinishDecode, sizeof(FinishDecode)) != 0)
+				continue;
+			++DecoderImplementationMatches;
+
+			const std::uint32_t ResultRotate = Rotate[14 + sizeof(FinishDecode)];
+			if (!ResultRotate)
+				continue;
+
+			const std::uint8_t* ShuffleInstruction = nullptr;
+			for (const auto* Candidate = Rotate - 16; Candidate + 5 <= Rotate; ++Candidate)
+			{
+				if (std::memcmp(Candidate, "\x66\x0F\x38\x00\xC6", 5) == 0)
+					ShuffleInstruction = Candidate;
+			}
+			if (!ShuffleInstruction)
+				continue;
+
+			std::uint32_t NameOffset = 0;
+			for (const auto* Load = Rotate - 16; Load < ShuffleInstruction; ++Load)
+			{
+				if (Load[0] != 0x66)
+					continue;
+				std::size_t Cursor = 1;
+				if ((Load[Cursor] & 0xF0) == 0x40)
+					++Cursor;
+				if (Load[Cursor] != 0x0F || Load[Cursor + 1] != 0x6F)
+					continue;
+				const std::uint8_t ModRm = Load[Cursor + 2];
+				if ((ModRm >> 6) == 1)
+					NameOffset = Load[Cursor + 3];
+				else if ((ModRm >> 6) == 2)
+					std::memcpy(&NameOffset, Load + Cursor + 3, sizeof(NameOffset));
+			}
+			if (NameOffset)
+				++DecoderNameMatches;
+
+			const std::uint8_t* Control = nullptr;
+			for (const auto* Instruction = Rotate - 0x80; Instruction + 8 <= ShuffleInstruction; ++Instruction)
+			{
+				if (Instruction[0] != 0xF3 || Instruction[1] != 0x0F || Instruction[2] != 0x7E || (Instruction[3] & 0xC7) != 0x05)
+					continue;
+				std::int32_t Relative = 0;
+				std::memcpy(&Relative, Instruction + 4, sizeof(Relative));
+				const auto* Candidate = Instruction + 8 + Relative;
+				if (reinterpret_cast<std::uintptr_t>(Candidate) >= ModuleBase && reinterpret_cast<std::uintptr_t>(Candidate + 7) < ModuleEnd && !Platform::IsBadReadPtr(Candidate + 7))
+					Control = Candidate;
+			}
+			if (Control)
+				++DecoderControlMatches;
+
+			std::uint64_t XorKey = 0;
+			for (const auto* Instruction = Rotate - 0x80; Instruction + 10 <= Rotate; ++Instruction)
+			{
+				if (Instruction[0] == 0x48 && Instruction[1] == 0xBB)
+					std::memcpy(&XorKey, Instruction + 2, sizeof(XorKey));
+			}
+			if (XorKey)
+				++DecoderKeyMatches;
+
+			if (!NameOffset || !Control || !XorKey)
+				continue;
+
+			Decoder Candidate{ NameOffset, Rotate[9], ResultRotate, XorKey, {} };
+			std::memcpy(Candidate.Shuffle.data(), Control, Candidate.Shuffle.size());
+			Decoders.insert(Candidate);
+		}
+	}
+
+	if (Decoders.size() != 1)
+		throw std::runtime_error(std::format("Discovery FField name decoder matched {} parameter sets from {} implementations across {} ranges (name {}, control {}, key {})", Decoders.size(), DecoderImplementationMatches, ReadableRanges.size(), DecoderNameMatches, DecoderControlMatches, DecoderKeyMatches));
+
+	const Decoder& Selected = *Decoders.begin();
+	Discovery::FieldNameOffset = Selected.NameOffset;
+	Discovery::FieldNameWordRotate = Selected.WordRotate;
+	Discovery::FieldNameResultRotate = Selected.ResultRotate;
+	Discovery::FieldNameXorKey = Selected.XorKey;
+	Discovery::FieldNameShuffle = Selected.Shuffle;
+	Discovery::FieldNameDecoderReady = true;
+
+	const UEStruct Guid = ObjectArray::FindStructFast("Guid");
+	const UEStruct Vector = ObjectArray::FindStructFast("Vector");
+	const UEStruct Color = ObjectArray::FindStructFast("Color");
+	const auto* GuidChild = static_cast<const std::uint8_t*>(Guid.GetChildProperties().GetAddress());
+	const auto* VectorChild = static_cast<const std::uint8_t*>(Vector.GetChildProperties().GetAddress());
+	const auto* ColorChild = static_cast<const std::uint8_t*>(Color.GetChildProperties().GetAddress());
+	if (!GuidChild || !VectorChild || !ColorChild)
+		throw std::runtime_error("Discovery FField layout validation could not read known child-property chains");
+
+	const std::string GuidName = FName(Discovery::GetFieldName(GuidChild)).ToString();
+	const std::string VectorName = FName(Discovery::GetFieldName(VectorChild)).ToString();
+	if ((GuidName != "A" && GuidName != "D") || (VectorName != "X" && VectorName != "Z"))
+		throw std::runtime_error(std::format("Discovery FField name decoder failed known-name validation: Guid={}, Vector={}", GuidName, VectorName));
+
+	auto IsField = [&](const std::uint8_t* Field)
+	{
+		if (!Field || (reinterpret_cast<std::uintptr_t>(Field) & 0x7) || Platform::IsBadReadPtr(Field))
+			return false;
+		const std::uintptr_t Vft = *reinterpret_cast<const std::uintptr_t*>(Field);
+		return Vft >= ModuleBase && Vft < ModuleEnd;
+	};
+	auto ChainLength = [&](const std::uint8_t* Field, const int32 Offset)
+	{
+		int Length = 0;
+		std::array<const std::uint8_t*, 16> Seen{};
+		while (Field && Length < static_cast<int>(Seen.size()))
+		{
+			if (!IsField(Field) || std::find(Seen.begin(), Seen.begin() + Length, Field) != Seen.begin() + Length)
+				return -1;
+			Seen[Length++] = Field;
+			Field = *reinterpret_cast<const std::uint8_t* const*>(Field + Offset);
+		}
+		return Field ? -1 : Length;
+	};
+
+	std::vector<int32> NextCandidates;
+	for (int32 Offset = 0x8; Offset < 0x90; Offset += sizeof(void*))
+	{
+		if (ChainLength(GuidChild, Offset) == 4 && ChainLength(VectorChild, Offset) == 3 && ChainLength(ColorChild, Offset) == 4)
+			NextCandidates.push_back(Offset);
+	}
+	if (NextCandidates.size() != 1)
+		throw std::runtime_error(std::format("Discovery FField::Next matched {} offsets", NextCandidates.size()));
+	Off::FField::Next = NextCandidates[0];
+
+	std::vector<int32> OwnerCandidates;
+	for (int32 Offset = 0x8; Offset < 0x90; Offset += sizeof(void*))
+	{
+		const std::uintptr_t GuidOwner = *reinterpret_cast<const std::uintptr_t*>(GuidChild + Offset) & ~1ull;
+		const std::uintptr_t VectorOwner = *reinterpret_cast<const std::uintptr_t*>(VectorChild + Offset) & ~1ull;
+		const std::uintptr_t ColorOwner = *reinterpret_cast<const std::uintptr_t*>(ColorChild + Offset) & ~1ull;
+		if (GuidOwner == reinterpret_cast<std::uintptr_t>(Guid.GetAddress()) && VectorOwner == reinterpret_cast<std::uintptr_t>(Vector.GetAddress()) && ColorOwner == reinterpret_cast<std::uintptr_t>(Color.GetAddress()))
+			OwnerCandidates.push_back(Offset);
+	}
+	if (OwnerCandidates.size() != 1)
+		throw std::runtime_error(std::format("Discovery FField::Owner matched {} offsets", OwnerCandidates.size()));
+	Off::FField::Owner = OwnerCandidates[0];
+
+	const std::uint64_t IntCast = static_cast<std::uint64_t>(EClassCastFlags::Field | EClassCastFlags::Property | EClassCastFlags::NumericProperty | EClassCastFlags::IntProperty);
+	const std::uint64_t ByteCast = static_cast<std::uint64_t>(EClassCastFlags::Field | EClassCastFlags::Property | EClassCastFlags::NumericProperty | EClassCastFlags::ByteProperty);
+	std::vector<std::pair<int32, int32>> ClassCandidates;
+	for (int32 ClassOffset = 0x8; ClassOffset < 0x90; ClassOffset += sizeof(void*))
+	{
+		const auto* GuidClass = *reinterpret_cast<const std::uint8_t* const*>(GuidChild + ClassOffset);
+		const auto* ColorClass = *reinterpret_cast<const std::uint8_t* const*>(ColorChild + ClassOffset);
+		if (!GuidClass || GuidClass == ColorClass || reinterpret_cast<std::uintptr_t>(GuidClass) < ModuleBase || reinterpret_cast<std::uintptr_t>(GuidClass) >= ModuleEnd || reinterpret_cast<std::uintptr_t>(ColorClass) < ModuleBase || reinterpret_cast<std::uintptr_t>(ColorClass) >= ModuleEnd)
+			continue;
+		for (int32 CastOffset = 0; CastOffset < 0x80; CastOffset += sizeof(std::uint64_t))
+		{
+			if (*reinterpret_cast<const std::uint64_t*>(GuidClass + CastOffset) == IntCast && *reinterpret_cast<const std::uint64_t*>(ColorClass + CastOffset) == ByteCast)
+				ClassCandidates.emplace_back(ClassOffset, CastOffset);
+		}
+	}
+	if (ClassCandidates.size() != 1)
+		throw std::runtime_error(std::format("Discovery FField class/cast layout matched {} pairs", ClassCandidates.size()));
+	Off::FField::Class = ClassCandidates[0].first;
+	Off::FFieldClass::CastFlags = ClassCandidates[0].second;
+	Off::FField::Name = Discovery::FieldNameOffset;
+	Off::FField::Flags = Discovery::FieldNameOffset + 0x10;
+	Off::FFieldClass::Name = Discovery::FieldNameOffset;
+
+	const auto* IntClass = *reinterpret_cast<const std::uint8_t* const*>(GuidChild + Off::FField::Class);
+	const auto* ByteClass = *reinterpret_cast<const std::uint8_t* const*>(ColorChild + Off::FField::Class);
+	std::vector<int32> IdCandidates;
+	for (int32 Offset = 0; Offset < 0x90; Offset += sizeof(std::uint64_t))
+	{
+		if (*reinterpret_cast<const EFieldClassID*>(IntClass + Offset) == EFieldClassID::Int && *reinterpret_cast<const EFieldClassID*>(ByteClass + Offset) == EFieldClassID::Byte)
+			IdCandidates.push_back(Offset);
+	}
+	if (IdCandidates.size() != 1)
+		throw std::runtime_error(std::format("Discovery FFieldClass::Id matched {} offsets", IdCandidates.size()));
+	Off::FFieldClass::Id = IdCandidates[0];
+
+	const std::uint64_t NumericCast = static_cast<std::uint64_t>(EClassCastFlags::Field | EClassCastFlags::Property | EClassCastFlags::NumericProperty);
+	std::vector<int32> SuperCandidates;
+	for (int32 Offset = 0; Offset < 0x90; Offset += sizeof(void*))
+	{
+		const auto* IntSuper = *reinterpret_cast<const std::uint8_t* const*>(IntClass + Offset);
+		const auto* ByteSuper = *reinterpret_cast<const std::uint8_t* const*>(ByteClass + Offset);
+		if (!IntSuper || IntSuper != ByteSuper || reinterpret_cast<std::uintptr_t>(IntSuper) < ModuleBase || reinterpret_cast<std::uintptr_t>(IntSuper) >= ModuleEnd)
+			continue;
+		if (*reinterpret_cast<const std::uint64_t*>(IntSuper + Off::FFieldClass::CastFlags) == NumericCast)
+			SuperCandidates.push_back(Offset);
+	}
+	if (SuperCandidates.size() != 1)
+		throw std::runtime_error(std::format("Discovery FFieldClass::SuperClass matched {} offsets", SuperCandidates.size()));
+	Off::FFieldClass::SuperClass = SuperCandidates[0];
+
+	// This separately protected member is not consumed by the dumper. Do not emit
+	// a guessed raw field into generated output.
+	Off::FFieldClass::ClassFlags = OffsetFinder::OffsetNotFound;
+	Settings::Internal::bUseMaskForFieldOwner = true;
+	std::cerr << std::format("Discovery FField decoder/layout recovered: name +0x{:X}, next +0x{:X}, class +0x{:X}, owner +0x{:X}, cast +0x{:X}, id +0x{:X}, super +0x{:X}\n", Off::FField::Name, Off::FField::Next, Off::FField::Class, Off::FField::Owner, Off::FFieldClass::CastFlags, Off::FFieldClass::Id, Off::FFieldClass::SuperClass);
+}
+
 void OffsetFinder::InitFNameSettings()
 {
 	UEObject FirstObject = ObjectArray::GetByIndex(0);
@@ -446,7 +716,8 @@ int32_t OffsetFinder::FindUFieldNextOffset()
 	const auto HighestUObjectOffset = std::max({ Off::UObject::Index, Off::UObject::Name, Off::UObject::Flags, Off::UObject::Outer, Off::UObject::Class });
 #define max(a,b)            (((a) > (b)) ? (a) : (b))
 
-	return GetValidPointerOffset(KismetSystemLibraryChild, KismetStringLibraryChild, Align(HighestUObjectOffset + 0x4, static_cast<int>(sizeof(void*))), 0x60);
+	const int32_t SearchEnd = Discovery::Enabled ? 0xD0 : 0x60;
+	return GetValidPointerOffset(KismetSystemLibraryChild, KismetStringLibraryChild, Align(HighestUObjectOffset + 0x4, static_cast<int>(sizeof(void*))), SearchEnd);
 }
 
 /* FField */
@@ -455,7 +726,20 @@ int32_t OffsetFinder::FindFFieldNextOffset()
 	const void* GuidChildren = ObjectArray::FindStructFast("Guid").GetChildProperties().GetAddress();
 	const void* VectorChildren = ObjectArray::FindStructFast("Vector").GetChildProperties().GetAddress();
 
-	return GetValidPointerOffset(GuidChildren, VectorChildren, Off::FField::Owner + 0x8, 0x48);
+	if (Discovery::Enabled)
+	{
+		std::cerr << std::format("Discovery Guid ChildProperties: 0x{:X}\n", reinterpret_cast<uintptr_t>(GuidChildren));
+		std::cerr << std::format("Discovery Vector ChildProperties: 0x{:X}\n", reinterpret_cast<uintptr_t>(VectorChildren));
+		for (int32_t Offset = 0; Offset < 0x60; Offset += sizeof(void*))
+		{
+			const auto GuidValue = *reinterpret_cast<const uintptr_t*>(static_cast<const uint8_t*>(GuidChildren) + Offset);
+			const auto VectorValue = *reinterpret_cast<const uintptr_t*>(static_cast<const uint8_t*>(VectorChildren) + Offset);
+			std::cerr << std::format("  FField +0x{:02X}: Guid=0x{:016X} Vector=0x{:016X}\n", Offset, GuidValue, VectorValue);
+		}
+	}
+
+	const int32_t SearchEnd = Discovery::Enabled ? 0xB0 : 0x48;
+	return GetValidPointerOffset(GuidChildren, VectorChildren, Off::FField::Owner + 0x8, SearchEnd);
 }
 
 int32_t OffsetFinder::FindFFieldNameOffset()
@@ -748,7 +1032,8 @@ int32_t OffsetFinder::FindChildPropertiesOffset()
 	const void* ObjA = ObjectArray::FindStructFast("Color").GetAddress();
 	const void* ObjB = ObjectArray::FindStructFast("Guid").GetAddress();
 
-	return GetValidPointerOffset(ObjA, ObjB, Off::UStruct::Children + 0x08, 0x80);
+	const int32_t SearchEnd = Discovery::Enabled ? 0x120 : 0x80;
+	return GetValidPointerOffset(ObjA, ObjB, Off::UStruct::Children + 0x08, SearchEnd);
 }
 
 int32_t OffsetFinder::FindStructSizeOffset()
@@ -841,15 +1126,68 @@ int32_t OffsetFinder::FindFunctionFlagsOffset()
 	if (Infos[2].first == nullptr)
 		Infos[2].first = ObjectArray::FindObjectFast("FOV", EClassCastFlags::Function).GetAddress();
 
+	if (Discovery::Enabled)
+	{
+		if (Off::UFunction::FunctionFlags == OffsetNotFound)
+			return OffsetNotFound;
+
+		bool HasKey = false;
+		uint32_t CommonKey = 0;
+		for (const auto& [Object, ExpectedFlags] : Infos)
+		{
+			if (!Object)
+				return OffsetNotFound;
+
+			const uint32_t EncodedFlags = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(Object) + Off::UFunction::FunctionFlags);
+			const uint32_t CandidateKey = EncodedFlags ^ static_cast<uint32_t>(ExpectedFlags);
+			if (!HasKey)
+			{
+				CommonKey = CandidateKey;
+				HasKey = true;
+			}
+			else if (CandidateKey != CommonKey)
+			{
+				return OffsetNotFound;
+			}
+		}
+
+		Discovery::FunctionFlagsXorKey = CommonKey;
+		std::cerr << std::format("Discovery UFunction::FunctionFlags validated at +0x{:X} with XOR key 0x{:08X}\n", Off::UFunction::FunctionFlags, CommonKey);
+		return Off::UFunction::FunctionFlags;
+	}
+
 	const int32 Ret = FindOffset(Infos);
 
 	if (Ret != OffsetNotFound)
+	{
+		if (Discovery::Enabled)
+			Discovery::FunctionFlagsXorKey = 0;
 		return Ret;
+	}
 
 	for (auto& [_, Flags] : Infos)
 		Flags |= EFunctionFlags::RequiredAPI;
 
-	return FindOffset(Infos);
+	const int32_t RequiredApiRet = FindOffset(Infos);
+	if (Discovery::Enabled && RequiredApiRet != OffsetNotFound)
+		Discovery::FunctionFlagsXorKey = static_cast<uint32_t>(EFunctionFlags::RequiredAPI);
+	if (Discovery::Enabled && RequiredApiRet == OffsetNotFound)
+	{
+		std::cerr << "Discovery UFunction flag candidates:\n";
+		for (const auto& [Object, ExpectedFlags] : Infos)
+		{
+			std::cerr << std::format("  function=0x{:X} expected=0x{:08X}\n", reinterpret_cast<uintptr_t>(Object), static_cast<uint32_t>(ExpectedFlags));
+			if (!Object)
+				continue;
+			for (int32_t Offset = 0x130; Offset < 0x260; Offset += 0x10)
+			{
+				const auto* Values = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(Object) + Offset);
+				std::cerr << std::format("    +0x{:03X}: {:08X} {:08X} {:08X} {:08X}\n", Offset, Values[0], Values[1], Values[2], Values[3]);
+			}
+		}
+	}
+
+	return RequiredApiRet;
 }
 
 int32_t OffsetFinder::FindFunctionNativeFuncOffset()
@@ -864,7 +1202,10 @@ int32_t OffsetFinder::FindFunctionNativeFuncOffset()
 	if (SwitchLevel_Or_FOV == NULL)
 		SwitchLevel_Or_FOV = reinterpret_cast<uintptr_t>(ObjectArray::FindObjectFast("FOV", EClassCastFlags::Function).GetAddress());
 
-	for (int i = 0x30; i < 0x140; i += sizeof(void*))
+	if (!WasInputKeyJustPressed || !ToggleSpeaking || !SwitchLevel_Or_FOV)
+		return OffsetNotFound;
+
+	for (int i = 0x30; i < 0x300; i += sizeof(void*))
 	{
 		if (Platform::IsAddressInProcessRange(*reinterpret_cast<uintptr_t*>(WasInputKeyJustPressed + i)) &&
 			Platform::IsAddressInProcessRange(*reinterpret_cast<uintptr_t*>(ToggleSpeaking + i)) && Platform::IsAddressInProcessRange(*reinterpret_cast<uintptr_t*>(SwitchLevel_Or_FOV + i)))
@@ -962,6 +1303,47 @@ int32_t OffsetFinder::FindPropertyFlagsOffset()
 	if (Infos[1].first == nullptr) [[unlikely]]
 		Infos[1].first = Color.FindMember("r").GetAddress();
 
+	if (Discovery::Enabled)
+	{
+		Infos.push_back({ Guid.FindMember("C").GetAddress(), GuidMemberFlags });
+		Infos.push_back({ Guid.FindMember("D").GetAddress(), GuidMemberFlags });
+		Infos.push_back({ Color.FindMember("G").GetAddress(), ColorMemberFlags });
+		Infos.push_back({ Color.FindMember("B").GetAddress(), ColorMemberFlags });
+
+		for (const auto& [Object, _] : Infos)
+		{
+			if (!Object)
+				return OffsetNotFound;
+		}
+
+		std::vector<std::pair<int32_t, uint64_t>> Candidates;
+		for (int32_t Offset = 0x40; Offset < 0x180; Offset += sizeof(uint64_t))
+		{
+			const uint64_t FirstRawFlags = *reinterpret_cast<const uint64_t*>(static_cast<const uint8_t*>(Infos[0].first) + Offset);
+			const uint64_t CandidateKey = FirstRawFlags ^ static_cast<uint64_t>(Infos[0].second);
+			bool MatchesAll = true;
+			for (const auto& [Object, ExpectedFlags] : Infos)
+			{
+				const uint64_t RawFlags = *reinterpret_cast<const uint64_t*>(static_cast<const uint8_t*>(Object) + Offset);
+				if ((RawFlags ^ CandidateKey) != static_cast<uint64_t>(ExpectedFlags))
+				{
+					MatchesAll = false;
+					break;
+				}
+			}
+
+			if (MatchesAll)
+				Candidates.push_back({ Offset, CandidateKey });
+		}
+
+		if (Candidates.size() != 1)
+			return OffsetNotFound;
+
+		Discovery::PropertyFlagsXorKey = Candidates[0].second;
+		std::cerr << std::format("Discovery FProperty flags recovered at +0x{:X} with XOR key 0x{:016X}\n", Candidates[0].first, Candidates[0].second);
+		return Candidates[0].first;
+	}
+
 	int FlagsOffset = FindOffset(Infos);
 
 	// Same flags without AccessSpecifier
@@ -991,7 +1373,41 @@ int32_t OffsetFinder::FindOffsetInternalOffset()
 	if (Infos[2].first == nullptr) [[unlikely]]
 		Infos[2].first = Color.FindMember("r").GetAddress();
 
-	return FindOffset(Infos);
+	if (!Discovery::Enabled)
+		return FindOffset(Infos);
+
+	if (!Infos[0].first || !Infos[1].first || !Infos[2].first)
+		return OffsetNotFound;
+
+	std::vector<std::pair<int32_t, uint32_t>> Candidates;
+	for (int32_t Offset = 0x40; Offset < 0x180; Offset += sizeof(uint32_t))
+	{
+		const uint32_t Key = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(Infos[0].first) + Offset);
+		bool bMatches = true;
+		for (const auto& [Object, Expected] : Infos)
+		{
+			const uint32_t Raw = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(Object) + Offset);
+			const uint32_t Decoded = _byteswap_ulong(Raw ^ Key);
+			if (Decoded != static_cast<uint32_t>(Expected))
+			{
+				bMatches = false;
+				break;
+			}
+		}
+
+		if (bMatches)
+			Candidates.emplace_back(Offset, Key);
+	}
+
+	if (Candidates.size() != 1)
+	{
+		std::cerr << std::format("Discovery FProperty offset decoder matched {} candidate layouts\n", Candidates.size());
+		return OffsetNotFound;
+	}
+
+	Discovery::PropertyOffsetXorKey = Candidates[0].second;
+	std::cerr << std::format("Discovery FProperty offset decoder recovered XOR key 0x{:08X}\n", Discovery::PropertyOffsetXorKey);
+	return Candidates[0].first;
 }
 
 /* BoolProperty */
@@ -1004,7 +1420,8 @@ int32_t OffsetFinder::FindBoolPropertyBaseOffset()
 	Infos.push_back({ Engine.FindMember("bEnableOnScreenDebugMessagesDisplay").GetAddress(), 0b00000010 });
 	Infos.push_back({ ObjectArray::FindClassFast("PlayerController").FindMember("bAutoManageActiveCameraTarget").GetAddress(), 0xFF });
 
-	return (FindOffset<1>(Infos, Off::Property::Offset_Internal) - 0x3);
+	const int32_t MinimumOffset = Discovery::Enabled ? Off::ObjectProperty::PropertyClass : Off::Property::Offset_Internal;
+	return (FindOffset<1>(Infos, MinimumOffset) - 0x3);
 }
 
 /* ObjectPrperty */
@@ -1254,4 +1671,3 @@ int32_t OffsetFinder::FindDatatableRowMapOffset()
 
 	return RowStructProp.GetOffset() + RowStructProp.GetSize();
 }
-

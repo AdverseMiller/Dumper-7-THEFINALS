@@ -14,13 +14,13 @@ namespace EnumInitHelper
 			Size = 0x8;
 		}
 		else if (EnumValue > GetMaxOfType<uint16>()) {
-			Size = max(Size, 0x4);
+			Size = std::max<uint8>(Size, 0x4);
 		}
 		else if (EnumValue > GetMaxOfType<uint8>()) {
-			Size = max(Size, 0x2);
+			Size = std::max<uint8>(Size, 0x2);
 		}
 		else {
-			Size = max(Size, 0x1);
+			Size = std::max<uint8>(Size, 0x1);
 		}
 	}
 }
@@ -125,14 +125,14 @@ void EnumManager::InitInternal()
 				if (Enum)
 				{
 					const int32 PropertySize = Property.GetSize();
-					Info.UnderlyingTypeSize = max(Info.UnderlyingTypeSize, PropertySize);
+					Info.UnderlyingTypeSize = std::max<uint8>(Info.UnderlyingTypeSize, static_cast<uint8>(PropertySize));
 					continue;
 				}
 
 				if (UnderlayingProperty)
 				{
 					const int32 PropertySize = UnderlayingProperty.GetSize();
-					Info.UnderlyingTypeSize = max(Info.UnderlyingTypeSize, PropertySize);
+					Info.UnderlyingTypeSize = std::max<uint8>(Info.UnderlyingTypeSize, static_cast<uint8>(PropertySize));
 					continue;
 				}
 			}
@@ -156,7 +156,7 @@ void EnumManager::InitInternal()
 				std::wstring NameWitPrefix = Name.ToWString();
 
 				if (!NameWitPrefix.ends_with(L"_MAX"))
-					EnumMaxValue = max(EnumMaxValue, Value);
+					EnumMaxValue = std::max<uint64>(EnumMaxValue, static_cast<uint64>(Value));
 
 				auto [NameIndex, bWasInserted] = UniqueEnumValueNames.FindOrAdd(MakeNameValid(NameWitPrefix.substr(NameWitPrefix.find_last_of(L"::") + 1)));
 

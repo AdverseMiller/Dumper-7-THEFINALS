@@ -38,6 +38,7 @@ private:
 
 public:
 	static void InitDecryption(uint8_t* (*DecryptionFunction)(void* ObjPtr), const char* DecryptionLambdaAsStr);
+	static void InitDiscovery(const char* const ModuleName = Settings::General::DefaultModuleName);
 
 	static void Init(bool bScanAllMemory = false, const char* const ModuleName = Settings::General::DefaultModuleName);
 
@@ -51,6 +52,7 @@ public:
 	static int32 Max();
 	static int32 NumChunks();
 	static int32 MaxChunks();
+	static uint32 GetInternalIndexOffset();
 
 	template<typename UEType = UEObject>
 	static UEType GetByIndex(int32 Index);
@@ -137,8 +139,8 @@ public:
 	UEProperty operator*() const;
 
 private:
-	inline void IterateToNextStruct();
-	inline void IterateToNextStructWithMembers();
+	void IterateToNextStruct();
+	void IterateToNextStructWithMembers();
 
 private:
 	inline bool CurrenStructHasMoreMembers() const

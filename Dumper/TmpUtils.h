@@ -1,4 +1,7 @@
 #pragma once
+
+#include <cstdint>
+#include <cstring>
 #include <string>
 #include <algorithm>
 #include <cassert>
@@ -64,4 +67,3 @@ inline bool StrnCmpHelper(const CharType* Left, const CharType* Right, size_t Nu
 		return wcsncmp(Left, Right, NumCharsToCompare) == 0;
 	}
 }
-

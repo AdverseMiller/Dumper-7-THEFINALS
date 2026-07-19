@@ -1,4 +1,5 @@
 #include "Wrappers/MemberWrappers.h"
+#include "Unreal/Discovery.h"
 
 
 PropertyWrapper::PropertyWrapper(const std::shared_ptr<StructWrapper>& Str, const PredefinedMember* Predef)
@@ -114,6 +115,13 @@ int32 PropertyWrapper::GetSize() const
         if (Property.IsA(EClassCastFlags::StructProperty) && (UnderlayingStruct = Property.Cast<UEStructProperty>().GetUnderlayingStruct()))
         {
             const int32 Size = StructManager::GetInfo(UnderlayingStruct).GetSize();
+
+            // Discovery's protected layout can leave a transient one-byte
+            // StructInfo placeholder even though FStructProperty::ElementSize
+            // already contains the validated native size. Prefer that direct
+            // value so generated FVector/FMinimalViewInfo layouts stay usable.
+            if (Discovery::Enabled && Size <= 0x1 && Property.GetSize() > Size)
+                return Property.GetSize();
 
             return Size > 0x0 ? Size : 0x1;
         }
@@ -330,4 +338,3 @@ bool FunctionWrapper::HasFunctionFlag(EFunctionFlags Flag) const
 {
     return bIsUnrealFunction && Function.HasFlags(Flag);
 }
-

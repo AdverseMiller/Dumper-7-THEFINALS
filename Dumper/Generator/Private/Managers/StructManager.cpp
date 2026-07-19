@@ -1,4 +1,6 @@
 #include "Unreal/ObjectArray.h"
+#include "Unreal/Discovery.h"
+#include "OffsetFinder/Offsets.h"
 #include "Managers/StructManager.h"
 
 StructInfoHandle::StructInfoHandle(const StructInfo& InInfo)
@@ -119,7 +121,7 @@ void StructManager::InitAlignmentsAndNames()
 		else
 		{
 			NewOrExistingInfo.bUseExplicitAlignment = MinAlignment > HighestMemberAlignment;
-			NewOrExistingInfo.Alignment = max(MinAlignment, HighestMemberAlignment);
+			NewOrExistingInfo.Alignment = std::max(MinAlignment, HighestMemberAlignment);
 		}
 	}
 
@@ -201,6 +203,9 @@ void StructManager::InitSizesAndIsFinal()
 		/* No need to check any other structs, as finding the LastMemberEnd only involves this struct */
 		Info.LastMemberEnd = LastMemberEnd;
 
+		if (NewOrExistingInfo.Size == 0 && LastMemberEnd > 0)
+			NewOrExistingInfo.Size = LastMemberEnd;
+
 		if (!Super || ObjAsStruct.IsA(EClassCastFlags::Function))
 			continue;
 
@@ -262,6 +267,14 @@ void StructManager::Init()
 	*/
 	const UEObject UObjectClass = ObjectArray::FindClassFast("Object");
 	StructInfoOverrides.find(UObjectClass.GetIndex())->second.Alignment = sizeof(void*);
+
+	if (Discovery::Enabled && Off::UStruct::StructBaseChain > Off::UField::Next)
+	{
+		const UEObject UFieldClass = ObjectArray::FindClassFast("Field");
+		StructInfo& UFieldInfo = StructInfoOverrides.find(UFieldClass.GetIndex())->second;
+		UFieldInfo.Size = Off::UStruct::StructBaseChain;
+		UFieldInfo.bHasReusedTrailingPadding = true;
+	}
 
 	/* I still hate whoever decided to call "UStruct" "Ustruct" on some UE versions. */
 	if (const UEObject UStructClass = ObjectArray::FindClassFast("struct"))

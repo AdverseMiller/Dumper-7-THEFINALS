@@ -95,6 +95,7 @@ namespace OffsetFinder
 	int32_t NewFindFFieldNameOffset();
 	int32_t FindFFieldClassOffset();
 	int32_t FindFFieldEditorOnlyMetaDataOffset();
+	void InitDiscoveryFFieldLayout();
 
 	/* FFieldClass */
 	int32_t FindFieldClassCastFlagsOffset();

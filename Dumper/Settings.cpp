@@ -1,6 +1,7 @@
 #include "Settings.h"
 
-#include <Windows.h>
+#include <windows.h>
+#include <format>
 #include <filesystem>
 #include <string>
 
@@ -141,10 +142,10 @@ void Settings::Config::Load()
 
 	// Check for output path override
 	char SDKPath[256] = {};
-	GetPrivateProfileStringA("Settings", "SDKGenerationPath", "C:/Dumper-7", SDKPath, sizeof(SDKPath), ConfigPath);
+	GetPrivateProfileStringA("Settings", "SDKGenerationPath", DefaultOutputPath, SDKPath, sizeof(SDKPath), ConfigPath);
 
 	// Path issues are generally resolved during generation but its better to catch during config load
-	if (strcmp(SDKPath, "C:/Dumper-7") != 0)
+	if (strcmp(SDKPath, DefaultOutputPath) != 0)
 	{
 		try
 		{
@@ -172,11 +173,11 @@ void Settings::Config::Load()
 		{
 			std::cerr << "Invalid SDK Generation Path: \n";
 			std::cerr << fe.what() << std::endl;
-			std::cerr << "Falling back to default path: C:/Dumper-7 \n";
+			std::cerr << "Falling back to default path: " << DefaultOutputPath << "\n";
 		}
 	}
 	
-	SleepTimeout = max(GetPrivateProfileIntA("Settings", "SleepTimeout", 0, ConfigPath), 0);
+	SleepTimeout = std::max(GetPrivateProfileIntA("Settings", "SleepTimeout", 0, ConfigPath), 0u);
 
 	if (SleepTimeout > 0) 
 	{

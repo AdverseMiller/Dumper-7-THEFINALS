@@ -1,5 +1,7 @@
 
+#include <algorithm>
 #include <format>
+#include <stdexcept>
 
 #include "Unreal/UnrealTypes.h"
 #include "Unreal/NameArray.h"
@@ -7,6 +9,67 @@
 #include "Encoding/UnicodeNames.h"
 
 #include "Architecture.h"
+
+namespace
+{
+	void* FindDiscoveryAppendString(const char* const ModuleName)
+	{
+		constexpr const char* Signature = "41 56 41 55 56 57 53 48 83 EC ?? 48 89 D7 49 89 CE 48 8B 05 ?? ?? ?? ?? 48 31 E0 48 89 44 24 ?? 48 8B 02 48 89 42 08";
+		constexpr std::uintptr_t SignatureSize = 0x27;
+
+		const std::uintptr_t ModuleBase = Platform::GetModuleBase(ModuleName);
+		if (!ModuleBase)
+			throw std::runtime_error("Discovery FName::AppendString scan could not locate the main module");
+
+		const auto* DosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(ModuleBase);
+		if (Platform::IsBadReadPtr(DosHeader) || DosHeader->e_magic != IMAGE_DOS_SIGNATURE)
+			throw std::runtime_error("Discovery FName::AppendString scan found an invalid DOS header");
+
+		const auto* NtHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(ModuleBase + DosHeader->e_lfanew);
+		if (Platform::IsBadReadPtr(NtHeaders) || NtHeaders->Signature != IMAGE_NT_SIGNATURE)
+			throw std::runtime_error("Discovery FName::AppendString scan found an invalid NT header");
+
+		const std::uintptr_t ModuleEnd = ModuleBase + NtHeaders->OptionalHeader.SizeOfImage;
+		void* Match = nullptr;
+		bool bAmbiguous = false;
+
+		Platform::IterateMemoryRegionsWithCallback([&](void* Base, const size_t Size) -> bool
+		{
+			const std::uintptr_t RegionStart = reinterpret_cast<std::uintptr_t>(Base);
+			const std::uintptr_t RegionEnd = RegionStart + Size;
+			const std::uintptr_t SearchStart = std::max(RegionStart, ModuleBase);
+			const std::uintptr_t SearchEnd = std::min(RegionEnd, ModuleEnd);
+			if (SearchEnd <= SearchStart || SearchEnd - SearchStart <= SignatureSize)
+				return false;
+
+			std::uintptr_t Cursor = SearchStart;
+			while (Cursor + SignatureSize < SearchEnd)
+			{
+				void* Candidate = Platform::FindPatternInRange(Signature, Cursor, SearchEnd - Cursor);
+				if (!Candidate)
+					break;
+
+				if (Match && Match != Candidate)
+				{
+					bAmbiguous = true;
+					return true;
+				}
+
+				Match = Candidate;
+				Cursor = reinterpret_cast<std::uintptr_t>(Candidate) + 1;
+			}
+
+			return false;
+		}, false);
+
+		if (bAmbiguous)
+			throw std::runtime_error("Discovery FName::AppendString signature matched multiple locations");
+		if (!Match)
+			throw std::runtime_error("Discovery FName::AppendString signature was not found in readable main-module memory");
+
+		return Match;
+	}
+}
 
 
 std::string MakeNameValid(std::wstring&& Name)
@@ -66,6 +129,29 @@ FName::FName(const void* Ptr)
 {
 }
 
+FName::FName(uint64 Value)
+	: Address(reinterpret_cast<const uint8*>(&InlineValue)), InlineValue(Value), bOwnsInlineValue(true)
+{
+}
+
+FName::FName(const FName& Other)
+	: Address(Other.Address), InlineValue(Other.InlineValue), bOwnsInlineValue(Other.bOwnsInlineValue)
+{
+	if (bOwnsInlineValue)
+		Address = reinterpret_cast<const uint8*>(&InlineValue);
+}
+
+FName& FName::operator=(const FName& Other)
+{
+	if (this == &Other)
+		return *this;
+
+	InlineValue = Other.InlineValue;
+	bOwnsInlineValue = Other.bOwnsInlineValue;
+	Address = bOwnsInlineValue ? reinterpret_cast<const uint8*>(&InlineValue) : Other.Address;
+	return *this;
+}
+
 void FName::Init_Windows(bool bForceGNames)
 {
 #ifdef PLATFORM_WINDOWS
@@ -97,7 +183,7 @@ void FName::Init_Windows(bool bForceGNames)
 
 		for (int i = 0; !AppendString && i < PossibleSigs.size(); i++)
 		{
-			AppendString = static_cast<decltype(AppendString)>(Platform::FindPatternInRange(PossibleSigs[i], StringRef, 0x50, true, -1/* auto */));
+			AppendString = reinterpret_cast<decltype(AppendString)>(Platform::FindPatternInRange(PossibleSigs[i], StringRef, 0x50, true, -1/* auto */));
 
 			if (AppendString)
 				MatchingSig = PossibleSigs[i];
@@ -147,7 +233,7 @@ void FName::Init_Windows(bool bForceGNames)
 	}
 
 	if (AppendString == nullptr)
-		AppendString = static_cast<decltype(AppendString)>(TryFindApendStringBackupStringRef_Windows());
+		AppendString = reinterpret_cast<decltype(AppendString)>(TryFindApendStringBackupStringRef_Windows());
 
 	Off::InSDK::Name::AppendNameToString = AppendString && !bForceGNames ? Platform::GetOffset(AppendString) : 0x0;
 
@@ -248,6 +334,35 @@ void FName::Init(int32 OverrideOffset, EOffsetOverrideType OverrideType, bool bI
 	std::cerr << std::format("Manual-Override: FName::{} --> Offset 0x{:X}\n\n", (Off::InSDK::Name::bIsUsingAppendStringOverToString ? "AppendString" : "ToString"), Off::InSDK::Name::AppendNameToString);
 }
 
+void FName::InitDiscovery(const char* const ModuleName)
+{
+	struct WideStringBuilder
+	{
+		wchar_t* Begin;
+		wchar_t* Current;
+		wchar_t* End;
+	};
+
+	using DiscoveryAppendString = void(*)(const void*, WideStringBuilder&);
+	static DiscoveryAppendString Function = nullptr;
+	Function = reinterpret_cast<DiscoveryAppendString>(FindDiscoveryAppendString(ModuleName));
+	const int32 OverrideOffset = static_cast<int32>(Platform::GetOffset(Function, ModuleName));
+
+	Off::InSDK::Name::AppendNameToString = OverrideOffset;
+	Off::InSDK::Name::bIsUsingAppendStringOverToString = true;
+	Off::InSDK::Name::bIsAppendStringInlinedAndUsed = false;
+
+	ToStr = [](const void* Name) -> std::wstring
+	{
+		thread_local wchar_t Buffer[1024];
+		WideStringBuilder Builder{ Buffer, Buffer, Buffer + (sizeof(Buffer) / sizeof(Buffer[0])) };
+		Function(Name, Builder);
+		return std::wstring(Builder.Begin, Builder.Current);
+	};
+
+	std::cerr << std::format("Discovery FName::AppendString located dynamically at RVA 0x{:X}\n\n", OverrideOffset);
+}
+
 
 void* FName::TryFindApendStringBackupStringRef_Windows()
 {
@@ -279,10 +394,10 @@ void* FName::TryFindApendStringBackupStringRef_Windows()
 
 		for (int i = 0; !AppendString && i < PossibleSigs.size(); i++)
 		{
-			AppendString = static_cast<decltype(AppendString)>(Platform::FindPatternInRange(PossibleSigs[i], SigSearchStartAddress, 0x100, true, -1/* auto */));
+			AppendString = reinterpret_cast<decltype(AppendString)>(Platform::FindPatternInRange(PossibleSigs[i], SigSearchStartAddress, 0x100, true, -1/* auto */));
 
 			if (AppendString)
-				return AppendString;
+				return reinterpret_cast<void*>(AppendString);
 		}
 	}
 #endif // PLATFORM_WINDOWS
@@ -306,7 +421,7 @@ void FName::InitFallback()
 	int i = 0;
 	while (!AppendString && i < PossibleSigs.size())
 	{
-		AppendString = static_cast<decltype(AppendString)>(Platform::FindPatternInRange(PossibleSigs[i], Conv_NameToStringAddress, 0x90, -1 /* auto */));
+		AppendString = reinterpret_cast<decltype(AppendString)>(Platform::FindPatternInRange(PossibleSigs[i], Conv_NameToStringAddress, 0x90, -1 /* auto */));
 
 		i++;
 	}
