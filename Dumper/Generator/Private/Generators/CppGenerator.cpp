@@ -3630,6 +3630,7 @@ using namespace UC;
 * Disclaimer:
 *	- The 'GNames' is only a fallback and null by default, FName::AppendString is used
 *	- THe 'GWorld' offset is not used by the SDK, it's just there for "decoration", use the provided 'UWorld::GetWorld()' function instead
+*	- GObjects is zero when the dumper reconstructed the object array structurally and no stable module RVA exists
 */
 namespace Offsets
 {{
@@ -4127,6 +4128,8 @@ public:
 private:
 	inline void InitGObjects()
 	{
+		if (Offsets::GObjects == 0)
+			return;
 		GObjectsAddress = reinterpret_cast<void*>(InSDKUtils::GetImageBase() + Offsets::GObjects);
 	}
 

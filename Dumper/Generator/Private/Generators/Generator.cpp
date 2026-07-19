@@ -138,7 +138,7 @@ void Generator::WriteDiscoveryReport()
 	};
 
 	nlohmann::json Report;
-	Report["schema_version"] = 1;
+	Report["schema_version"] = 2;
 	Report["game"]["name"] = Settings::Generator::GameName;
 	Report["game"]["version"] = Settings::Generator::GameVersion;
 	Report["validation"]["mode"] = "read-only, fail-closed";
@@ -149,22 +149,16 @@ void Generator::WriteDiscoveryReport()
 	Report["generated_sdk"]["fproperty_protected_storage"] = "encoded members explicitly labeled";
 	Report["generated_sdk"]["ffield_class_flags"] = "omitted because decoder is not validated";
 
-	Report["object_array"]["protected_global_rva"] = Hex(Discovery::GlobalRva);
-	Report["object_array"]["decoder"]["model"] = Discovery::GlobalModel;
+	Report["object_array"]["strategy"] = "structural first-chunk reverse reference";
+	Report["object_array"]["global_cipher_used"] = false;
+	Report["object_array"]["stable_global_rva_available"] = false;
+	Report["object_array"]["chunk_table_runtime_address"] = Hex(Discovery::ChunkTableAddress);
+	Report["object_array"]["chunk_count"] = Discovery::ChunkCount;
+	Report["object_array"]["count_source"] = "highest structurally validated live InternalIndex plus one";
 	Report["object_array"]["object_count_at_bootstrap"] = Discovery::ObjectCount;
 	Report["object_array"]["elements_per_chunk"] = Discovery::ElementsPerChunk;
 	Report["object_array"]["fuobjectitem_size"] = Hex(Off::InSDK::ObjArray::FUObjectItemSize);
 	Report["object_array"]["internal_index_offset"] = Hex(ObjectArray::GetInternalIndexOffset());
-	if (Discovery::GlobalModel == "current-template-fallback")
-	{
-		Report["object_array"]["decoder"]["rotate_left"] = Discovery::GlobalRotate;
-		Report["object_array"]["decoder"]["mask_hex"] = BytesToHex(Discovery::GlobalMask);
-		Report["object_array"]["decoder"]["shuffle_hex"] = BytesToHex(Discovery::GlobalShuffle);
-		Report["object_array"]["decoder"]["count_offset"] = Hex(Discovery::GlobalCountOffset);
-		Report["object_array"]["decoder"]["count_xor"] = Hex(Discovery::GlobalCountXor);
-		Report["object_array"]["decoder"]["chunks_offset"] = Hex(Discovery::GlobalChunksOffset);
-		Report["object_array"]["decoder"]["chunks_xor"] = Hex(Discovery::GlobalChunksXor);
-	}
 
 	Report["fname"]["append_string_rva"] = Hex(Off::InSDK::Name::AppendNameToString);
 	Report["ftext"]["size"] = Hex(Off::InSDK::Text::TextSize);

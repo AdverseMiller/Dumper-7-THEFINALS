@@ -4,7 +4,6 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
-#include <string>
 
 namespace Discovery
 {
@@ -14,15 +13,8 @@ namespace Discovery
 	inline std::uint32_t ElementsPerChunk = 0;
 	inline constexpr std::uint32_t FUObjectItemSize = 0x14;
 	inline std::uint32_t ObjectCount = 0;
-	inline std::uint64_t GlobalRva = 0;
-	inline std::string GlobalModel = "unresolved";
-	inline std::uint32_t GlobalRotate = 0;
-	inline std::uint32_t GlobalCountOffset = 0;
-	inline std::uint32_t GlobalCountXor = 0;
-	inline std::uint32_t GlobalChunksOffset = 0;
-	inline std::uint64_t GlobalChunksXor = 0;
-	inline std::array<std::uint8_t, 16> GlobalMask{};
-	inline std::array<std::uint8_t, 16> GlobalShuffle{};
+	inline std::uintptr_t ChunkTableAddress = 0;
+	inline std::uint32_t ChunkCount = 0;
 	inline std::uint64_t ProcessEventDispatcherRva = 0;
 
 	inline std::uint32_t FunctionFlagsXorKey = 0;

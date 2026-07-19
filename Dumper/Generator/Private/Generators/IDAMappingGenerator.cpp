@@ -1003,7 +1003,8 @@ void IDAMappingGenerator::Generate()
 		NumGlobalSymbols++;
 	};
 
-	WriteNamedVar(static_cast<IDAMappingsLayouts::OffsetType>(Off::InSDK::ObjArray::GObjects), "TUObjectArray", "GObjects");
+	if (Off::InSDK::ObjArray::GObjects != 0x0)
+		WriteNamedVar(static_cast<IDAMappingsLayouts::OffsetType>(Off::InSDK::ObjArray::GObjects), "TUObjectArray", "GObjects");
 
 	const char* TypeName = Settings::Internal::bUseNamePool ? "TNameEntryArray" : "FNamePool";
 	WriteNamedVar(static_cast<IDAMappingsLayouts::OffsetType>(Off::InSDK::NameArray::GNames), TypeName, "GNames");
