@@ -64,7 +64,7 @@ On July 19, an independent read-only `/proc/<pid>/mem` validation exercised the 
 - the highest valid live index was `0x825F4`, producing enumeration limit `0x825F5`;
 - the table and limit exactly matched an independent decode of the protected global.
 
-The cipher-free C++ implementation builds successfully as a MinGW x64 DLL. Per request, it has not been loaded into the game.
+The cipher-free C++ implementation subsequently completed a live dump in 37.6 seconds. It scanned 1175.5 MiB before finding the structurally valid table, recovered the same table, geometry, and count listed above, generated all SDK artifacts, and left the game process running. The generated report recorded `global_cipher_used: false`, no stable global RVA, nine chunks, and object count `0x825F5`.
 
 The generated CoreUObject function unit passes a MinGW C++23 syntax check with its layout assertions enabled. Compiling `Basic.cpp` together with every transitively included package still exposes unrelated stock Dumper-7 generator issues in other engine types, including missing `<cmath>` declarations, invalid reflected enum widths, and several pre-existing tail-padding assertions. Those are broader SDK-generator correctness issues, not failures in the Discovery bootstrap or protected CoreUObject decoder.
 
