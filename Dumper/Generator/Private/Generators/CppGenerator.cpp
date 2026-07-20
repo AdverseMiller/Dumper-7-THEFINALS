@@ -1859,11 +1859,15 @@ void CppGenerator::InitPredefinedMembers()
 		if (Struct.Size > 0x0)
 			return;
 
-		if (Struct.Properties.empty() && Struct.Super)
-			Struct.Size = Struct.Super->Size;
+		if (Struct.Properties.empty())
+		{
+			if (Struct.Super)
+				Struct.Size = Struct.Super->Size;
+			return;
+		}
 
 		const PredefinedMember& LastMember = Struct.Properties[Struct.Properties.size() - 1];
-		Struct.Size = LastMember.Offset + LastMember.Size;
+		Struct.Size = LastMember.Offset + (LastMember.Size * std::max(LastMember.ArrayDim, 0x1));
 	};
 
 	// Initialize core predefined members shared with IDAMappingGenerator
@@ -2274,14 +2278,29 @@ void CppGenerator::InitPredefinedMembers()
 		if (Discovery::Enabled)
 		{
 			std::erase_if(FFieldClass.Properties, [](const PredefinedMember& Member) { return Member.Name == "ClassFlags"; });
+			std::erase_if(FField.Properties, [](const PredefinedMember& Member) { return Member.Name == "ObjFlags"; });
+			const auto GetProtectedNameSize = [](const std::vector<PredefinedMember>& Members, int32 NameOffset)
+			{
+				int32 EndOffset = 0x7FFFFFFF;
+				for (const PredefinedMember& Member : Members)
+				{
+					if (!Member.bIsStatic && !Member.bIsZeroSizeMember && Member.Offset > NameOffset)
+						EndOffset = std::min(EndOffset, Member.Offset);
+				}
+				if (EndOffset == 0x7FFFFFFF)
+					EndOffset = NameOffset + 0x10;
+				return std::max(0x10, EndOffset - NameOffset);
+			};
+			const int32 FFieldClassProtectedNameSize = GetProtectedNameSize(FFieldClass.Properties, Off::FFieldClass::Name);
+			const int32 FFieldProtectedNameSize = GetProtectedNameSize(FField.Properties, Off::FField::Name);
 			for (PredefinedMember& Member : FFieldClass.Properties)
 			{
 				if (Member.Name == "Name")
 				{
 					Member.Type = "uint8";
 					Member.Name = "ProtectedName";
-					Member.Size = 0x10;
-					Member.ArrayDim = 0x10;
+					Member.Size = sizeof(uint8);
+					Member.ArrayDim = FFieldClassProtectedNameSize;
 					Member.Alignment = alignof(uint8);
 					Member.Comment = "PROTECTED STORAGE; decode parameters are in discovery-report.json";
 				}
@@ -2292,8 +2311,8 @@ void CppGenerator::InitPredefinedMembers()
 				{
 					Member.Type = "uint8";
 					Member.Name = "ProtectedName";
-					Member.Size = 0x10;
-					Member.ArrayDim = 0x10;
+					Member.Size = sizeof(uint8);
+					Member.ArrayDim = FFieldProtectedNameSize;
 					Member.Alignment = alignof(uint8);
 					Member.Comment = "PROTECTED STORAGE; decode parameters are in discovery-report.json";
 				}
@@ -2498,7 +2517,10 @@ R"({
 		},
 		PredefinedFunction{
 			.CustomComment = "Checks a UObjects' type by TypeFlags",
-			.ReturnType = "bool", .NameWithParams = "IsA(EClassCastFlags TypeFlags)", .Body =
+			.ReturnType = "bool", .NameWithParams = "IsA(EClassCastFlags TypeFlags)", .Body = Discovery::Enabled ? std::format(
+R"({{
+	return (static_cast<EClassCastFlags>(static_cast<uint64>(Class->CastFlags) ^ 0x{:016X}ULL) & TypeFlags);
+}})", Discovery::ClassCastFlagsXorKey) :
 R"({
 	return (Class->CastFlags & TypeFlags);
 })",
@@ -2506,7 +2528,10 @@ R"({
 		},
 		PredefinedFunction{
 			.CustomComment = "Checks Class->FunctionFlags for TypeFlags",
-			.ReturnType = "bool", .NameWithParams = "HasTypeFlag(EClassCastFlags TypeFlags)", .Body =
+			.ReturnType = "bool", .NameWithParams = "HasTypeFlag(EClassCastFlags TypeFlags)", .Body = Discovery::Enabled ? std::format(
+R"({{
+	return (static_cast<EClassCastFlags>(static_cast<uint64>(Class->CastFlags) ^ 0x{:016X}ULL) & TypeFlags);
+}})", Discovery::ClassCastFlagsXorKey) :
 R"({
 	return (Class->CastFlags & TypeFlags);
 })",
@@ -2546,37 +2571,201 @@ R"({{
 			return Result;
 		};
 
-		const std::string Mask = FormatBytes(Discovery::ProtectedSlotMask);
-		const std::string Shuffle = FormatBytes(Discovery::ProtectedSlotShuffle);
-		const std::string HashBody = std::format(R"({{
-	const uintptr_t Address = reinterpret_cast<uintptr_t>(this) + 0x{:X};
-	uint32 Hash = static_cast<uint32>(Address);
-	const uint32 High = static_cast<uint32>(Address >> {});
-	Hash = std::rotl(Hash, {}) * 0x{:X}u + 0x{:X}u;
-	Hash = std::rotl(Hash, {}) * 0x{:X}u + High + 0x{:X}u;
-	Hash = std::rotl(Hash, {}) * 0x{:X}u + 0x{:X}u;
-	Hash = (Hash >> {}) * 0x{:X}u + 0x{:X}u;
-	return (Hash ^ (Hash >> {})) & 0x{:X}u;
-}})", Discovery::ProtectedAddressOffset, Discovery::ProtectedHashHighShift, Discovery::ProtectedHashRotate1, Discovery::ProtectedHashMultiplier, Discovery::ProtectedHashAddend, Discovery::ProtectedHashRotate2, Discovery::ProtectedHashMultiplier, Discovery::ProtectedHashAddend, Discovery::ProtectedHashRotate3, Discovery::ProtectedHashMultiplier, Discovery::ProtectedHashAddend, Discovery::ProtectedHashFinalShift, Discovery::ProtectedHashMultiplier, Discovery::ProtectedHashAddend, Discovery::ProtectedHashFoldShift, Discovery::ProtectedHashSlotMask);
-		const std::string DecodeBody = std::format(R"({{
-	const uint8 Mask[16] = {{ {} }};
-	const uint8 Shuffle[16] = {{ {} }};
-	const uint8* Encoded = reinterpret_cast<const uint8*>(this) + 0x{:X} + ((Slot & 0x3) * 0x{:X});
-	uint8 Mixed[16];
-	for (int32 Index = 0; Index < 16; ++Index)
-		Mixed[Index] = Encoded[Index] ^ Mask[Index];
-	uint64 Lanes[2];
-	std::memcpy(Lanes, Mixed, sizeof(Lanes));
-	for (uint64& Lane : Lanes)
-		Lane = std::rotl(Lane, {});
-	uint8 Shuffled[16];
-	const uint8* Bytes = reinterpret_cast<const uint8*>(Lanes);
-	for (int32 Index = 0; Index < 16; ++Index)
-		Shuffled[Index] = (Shuffle[Index] & 0x80) ? 0 : Bytes[Shuffle[Index] & 0x0F];
-	uint64 Result;
-	std::memcpy(&Result, Shuffled, sizeof(Result));
-	return Result;
-}})", Mask, Shuffle, Discovery::ProtectedSlotDataOffset, Discovery::ProtectedSlotStride, Discovery::ProtectedSlotRotate);
+		std::string ProgramRows;
+		for (std::uint32_t Index = 0; Index < Discovery::ProtectedSlotProgramSize; ++Index)
+		{
+			const Discovery::ProtectedVectorInstruction& Instruction = Discovery::ProtectedSlotProgram[Index];
+			ProgramRows += std::format("\t\t{{ {}, {}, {}, {}, {}, {{ {} }} }},\n", static_cast<std::uint8_t>(Instruction.Opcode), Instruction.Destination, Instruction.Source, Instruction.Immediate, Instruction.SourceIsConstant ? "true" : "false", FormatBytes(Instruction.Constant));
+		}
+		std::string HashProgramRows;
+		for (std::uint32_t Index = 0; Index < Discovery::ProtectedHashProgramSize; ++Index)
+		{
+			const Discovery::ProtectedScalarInstruction& Instruction = Discovery::ProtectedHashProgram[Index];
+			HashProgramRows += std::format("\t\t{{ {}, {}, {}, {}, 0x{:X}u }},\n", static_cast<std::uint8_t>(Instruction.Opcode), Instruction.Destination, Instruction.Source, Instruction.Is64Bit ? "true" : "false", Instruction.Immediate);
+		}
+		const std::string HashBody =
+			"{\n"
+			"\tstruct ScalarInstruction\n"
+			"\t{\n"
+			"\t\tuint8 Opcode;\n"
+			"\t\tuint8 Destination;\n"
+			"\t\tuint8 Source;\n"
+			"\t\tbool Is64Bit;\n"
+			"\t\tuint32 Immediate;\n"
+			"\t};\n"
+			"\tconstexpr ScalarInstruction Program[] =\n"
+			"\t{\n" + HashProgramRows +
+			"\t};\n"
+			"\tstd::array<uint64, 16> Registers{};\n"
+			"\tfor (const ScalarInstruction& Instruction : Program)\n"
+			"\t{\n"
+			"\t\tauto Write = [&](uint64 Value)\n"
+			"\t\t{\n"
+			"\t\t\tRegisters[Instruction.Destination] = Instruction.Is64Bit ? Value : static_cast<uint32>(Value);\n"
+			"\t\t};\n"
+			"\t\tswitch (Instruction.Opcode)\n"
+			"\t\t{\n"
+			"\t\tcase 0:\n"
+			"\t\t\tWrite(reinterpret_cast<uintptr_t>(this) + static_cast<int32>(Instruction.Immediate));\n"
+			"\t\t\tbreak;\n"
+			"\t\tcase 1:\n"
+			"\t\t\tWrite(Registers[Instruction.Source]);\n"
+			"\t\t\tbreak;\n"
+			"\t\tcase 2:\n"
+			"\t\t\tWrite(Registers[Instruction.Source] >> Instruction.Immediate);\n"
+			"\t\t\tbreak;\n"
+			"\t\tcase 3:\n"
+			"\t\t\tif (Instruction.Is64Bit)\n"
+			"\t\t\t\tWrite(std::rotl(Registers[Instruction.Source], static_cast<int>(Instruction.Immediate)));\n"
+			"\t\t\telse\n"
+			"\t\t\t\tWrite(std::rotl(static_cast<uint32>(Registers[Instruction.Source]), static_cast<int>(Instruction.Immediate)));\n"
+			"\t\t\tbreak;\n"
+			"\t\tcase 4:\n"
+			"\t\t\tWrite(static_cast<uint32>(Registers[Instruction.Source]) * Instruction.Immediate);\n"
+			"\t\t\tbreak;\n"
+			"\t\tcase 5:\n"
+			"\t\t\tWrite(Registers[Instruction.Destination] + Registers[Instruction.Source]);\n"
+			"\t\t\tbreak;\n"
+			"\t\tcase 6:\n"
+			"\t\tcase 7:\n"
+			"\t\t\tWrite(Registers[Instruction.Source] + static_cast<int32>(Instruction.Immediate));\n"
+			"\t\t\tbreak;\n"
+			"\t\tcase 8:\n"
+			"\t\t\tWrite(Registers[Instruction.Destination] ^ Registers[Instruction.Source]);\n"
+			"\t\t\tbreak;\n"
+			"\t\tcase 9:\n"
+			"\t\t\tWrite(Registers[Instruction.Source] + 1);\n"
+			"\t\t\tbreak;\n"
+			"\t\tcase 10:\n"
+			"\t\t\tWrite(Registers[Instruction.Source] & Instruction.Immediate);\n"
+			"\t\t\tbreak;\n"
+			"\t\tcase 11:\n"
+			"\t\t\treturn static_cast<uint32>(Registers[Instruction.Source]);\n"
+			"\t\t}\n"
+			"\t}\n"
+			"\treturn 0;\n"
+			"}";
+		const std::string DecodeBody =
+			"{\n"
+			"\tstruct VectorInstruction\n"
+			"\t{\n"
+			"\t\tuint8 Opcode;\n"
+			"\t\tuint8 Destination;\n"
+			"\t\tuint8 Source;\n"
+			"\t\tuint8 Immediate;\n"
+			"\t\tbool SourceIsConstant;\n"
+			"\t\tstd::array<uint8, 16> Constant;\n"
+			"\t};\n"
+			"\tconstexpr VectorInstruction Program[] =\n"
+			"\t{\n" + ProgramRows +
+			"\t};\n"
+			"\tstd::array<std::array<uint8, 16>, 16> Registers{};\n" +
+			std::format("\tconst uint8* Encoded = reinterpret_cast<const uint8*>(this) + 0x{:X} + ((Slot & 0x3) * 0x{:X});\n", Discovery::ProtectedSlotDataOffset, Discovery::ProtectedSlotStride) +
+			std::format("\tstd::memcpy(Registers[{}].data(), Encoded, 16);\n", Discovery::ProtectedSlotInputRegister) +
+			"\tfor (const VectorInstruction& Instruction : Program)\n"
+			"\t{\n"
+			"\t\tauto& Destination = Registers[Instruction.Destination];\n"
+			"\t\tconst auto& Source = Instruction.SourceIsConstant ? Instruction.Constant : Registers[Instruction.Source];\n"
+			"\t\tswitch (Instruction.Opcode)\n"
+			"\t\t{\n"
+			"\t\tcase 0:\n"
+			"\t\t\tDestination = Source;\n"
+			"\t\t\tbreak;\n"
+			"\t\tcase 1:\n"
+			"\t\t\tfor (std::size_t Byte = 0; Byte < Destination.size(); ++Byte)\n"
+			"\t\t\t\tDestination[Byte] ^= Source[Byte];\n"
+			"\t\t\tbreak;\n"
+			"\t\tcase 2:\n"
+			"\t\tcase 3:\n"
+			"\t\tcase 6:\n"
+			"\t\t{\n"
+			"\t\t\tstd::array<uint16, 8> DestinationWords{};\n"
+			"\t\t\tstd::array<uint16, 8> SourceWords{};\n"
+			"\t\t\tstd::memcpy(DestinationWords.data(), Destination.data(), Destination.size());\n"
+			"\t\t\tstd::memcpy(SourceWords.data(), Source.data(), Source.size());\n"
+			"\t\t\tfor (std::size_t Word = 0; Word < DestinationWords.size(); ++Word)\n"
+			"\t\t\t{\n"
+			"\t\t\t\tif (Instruction.Opcode == 2)\n"
+			"\t\t\t\t\tDestinationWords[Word] >>= Instruction.Immediate;\n"
+			"\t\t\t\telse if (Instruction.Opcode == 3)\n"
+			"\t\t\t\t\tDestinationWords[Word] <<= Instruction.Immediate;\n"
+			"\t\t\t\telse\n"
+			"\t\t\t\t\tDestinationWords[Word] += SourceWords[Word];\n"
+			"\t\t\t}\n"
+			"\t\t\tstd::memcpy(Destination.data(), DestinationWords.data(), Destination.size());\n"
+			"\t\t\tbreak;\n"
+			"\t\t}\n"
+			"\t\tcase 13:\n"
+			"\t\tcase 14:\n"
+			"\t\t{\n"
+			"\t\t\tstd::array<uint32, 4> Dwords{};\n"
+			"\t\t\tstd::memcpy(Dwords.data(), Destination.data(), Destination.size());\n"
+			"\t\t\tfor (uint32& Dword : Dwords)\n"
+			"\t\t\t{\n"
+			"\t\t\t\tif (Instruction.Opcode == 13)\n"
+			"\t\t\t\t\tDword >>= Instruction.Immediate;\n"
+			"\t\t\t\telse\n"
+			"\t\t\t\t\tDword <<= Instruction.Immediate;\n"
+			"\t\t\t}\n"
+			"\t\t\tstd::memcpy(Destination.data(), Dwords.data(), Destination.size());\n"
+			"\t\t\tbreak;\n"
+			"\t\t}\n"
+			"\t\tcase 4:\n"
+			"\t\tcase 5:\n"
+			"\t\t{\n"
+			"\t\t\tstd::array<uint64, 2> Qwords{};\n"
+			"\t\t\tstd::memcpy(Qwords.data(), Destination.data(), Destination.size());\n"
+			"\t\t\tfor (uint64& Qword : Qwords)\n"
+			"\t\t\t{\n"
+			"\t\t\t\tif (Instruction.Opcode == 4)\n"
+			"\t\t\t\t\tQword >>= Instruction.Immediate;\n"
+			"\t\t\t\telse\n"
+			"\t\t\t\t\tQword <<= Instruction.Immediate;\n"
+			"\t\t\t}\n"
+			"\t\t\tstd::memcpy(Destination.data(), Qwords.data(), Destination.size());\n"
+			"\t\t\tbreak;\n"
+			"\t\t}\n"
+			"\t\tcase 7:\n"
+			"\t\t\tfor (std::size_t Byte = 0; Byte < Destination.size(); ++Byte)\n"
+			"\t\t\t\tDestination[Byte] |= Source[Byte];\n"
+			"\t\t\tbreak;\n"
+			"\t\tcase 8:\n"
+			"\t\t{\n"
+			"\t\t\tconst auto Input = Source;\n"
+			"\t\t\tDestination = Input;\n"
+			"\t\t\tfor (std::size_t Word = 0; Word < 4; ++Word)\n"
+			"\t\t\t{\n"
+			"\t\t\t\tconst std::size_t SourceWord = (Instruction.Immediate >> (Word * 2)) & 0x3;\n"
+			"\t\t\t\tDestination[Word * 2] = Input[SourceWord * 2];\n"
+			"\t\t\t\tDestination[Word * 2 + 1] = Input[SourceWord * 2 + 1];\n"
+			"\t\t\t}\n"
+			"\t\t\tbreak;\n"
+			"\t\t}\n"
+			"\t\tcase 9:\n"
+			"\t\t{\n"
+			"\t\t\tconst auto Input = Destination;\n"
+			"\t\t\tfor (std::size_t Byte = 0; Byte < Destination.size(); ++Byte)\n"
+			"\t\t\t\tDestination[Byte] = (Source[Byte] & 0x80) ? 0 : Input[Source[Byte] & 0x0F];\n"
+			"\t\t\tbreak;\n"
+			"\t\t}\n"
+			"\t\tcase 10:\n"
+			"\t\t{\n"
+			"\t\t\tuint64 Result = 0;\n"
+			"\t\t\tstd::memcpy(&Result, Source.data(), sizeof(Result));\n"
+			"\t\t\treturn std::rotl(Result, static_cast<int>(Instruction.Immediate));\n"
+			"\t\t}\n"
+			"\t\tcase 11:\n"
+			"\t\t\tfor (std::size_t Byte = 0; Byte < Destination.size(); ++Byte)\n"
+			"\t\t\t\tDestination[Byte] &= Source[Byte];\n"
+			"\t\t\tbreak;\n"
+			"\t\tcase 12:\n"
+			"\t\t\tfor (std::size_t Byte = 0; Byte < Destination.size(); ++Byte)\n"
+			"\t\t\t\tDestination[Byte] = static_cast<uint8>(~Destination[Byte]) & Source[Byte];\n"
+			"\t\t\tbreak;\n"
+			"\t\t}\n"
+			"\t}\n"
+			"\treturn 0;\n"
+			"}";
 		const std::string GetClassBody = std::format(R"({{
 	constexpr uint8 Slots[4] = {{ {}, {}, {}, {} }};
 	return reinterpret_cast<UClass*>(DecodeProtectedSlot(Slots[GetProtectedBaseSlot()]));
@@ -2626,7 +2815,7 @@ R"({{
 			else if (Function.NameWithParams == "IsA(const class FName& ClassName)")
 				Function.Body = R"({ return GetClass()->IsSubclassOf(ClassName); })";
 			else if (Function.NameWithParams == "IsA(EClassCastFlags TypeFlags)" || Function.NameWithParams == "HasTypeFlag(EClassCastFlags TypeFlags)")
-				Function.Body = R"({ return (GetClass()->CastFlags & TypeFlags); })";
+				Function.Body = std::format(R"({{ return (static_cast<EClassCastFlags>(static_cast<uint64>(GetClass()->CastFlags) ^ 0x{:016X}ULL) & TypeFlags); }})", Discovery::ClassCastFlagsXorKey);
 		}
 	}
 	else

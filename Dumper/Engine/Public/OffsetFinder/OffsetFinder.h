@@ -15,37 +15,41 @@ namespace OffsetFinder
 	template<int Alignement = 4, typename T>
 	inline int32_t FindOffset(const std::vector<std::pair<void*, T>>& ObjectValuePair, int MinOffset = OffsetFinderMinValue, int MaxOffset = OffsetFinderMaxValue)
 	{
-		int32_t HighestFoundOffset = MinOffset;
-		bool bFoundOffset = false;
-
-		for (int i = 0; i < ObjectValuePair.size(); i++)
+		int32_t ValidAnchors = 0;
+		for (std::size_t Index = 0; Index < ObjectValuePair.size(); ++Index)
 		{
-			if (ObjectValuePair[i].first == nullptr)
+			if (ObjectValuePair[Index].first)
 			{
-				std::cerr << "Dumper-7 ERROR: FindOffset is skipping ObjectValuePair[" << i << "] because .first is nullptr." << std::endl;
+				++ValidAnchors;
 				continue;
 			}
 
-			for (int j = HighestFoundOffset; j < MaxOffset; j += Alignement)
-			{
-				const T TypedValueAtOffset = *reinterpret_cast<T*>(static_cast<uint8_t*>(ObjectValuePair[i].first) + j);
-
-				if (TypedValueAtOffset == ObjectValuePair[i].second && j >= HighestFoundOffset)
-				{
-					bFoundOffset = true;
-
-					if (j > HighestFoundOffset)
-					{
-						HighestFoundOffset = j;
-						i = 0;
-					}
-					j = MaxOffset;
-				}
-			}
+			std::cerr << "Dumper-7 ERROR: FindOffset is skipping ObjectValuePair[" << Index << "] because .first is nullptr." << std::endl;
 		}
 
-		//return HighestFoundOffset != MinOffset ? HighestFoundOffset : OffsetNotFound;
-		return bFoundOffset ? HighestFoundOffset : OffsetNotFound;
+		if (!ValidAnchors)
+			return OffsetNotFound;
+
+		for (int32_t Offset = MinOffset; Offset < MaxOffset; Offset += Alignement)
+		{
+			bool AllAnchorsMatch = true;
+			for (const auto& [Object, ExpectedValue] : ObjectValuePair)
+			{
+				if (!Object)
+					continue;
+				const T Value = *reinterpret_cast<const T*>(static_cast<const uint8_t*>(Object) + Offset);
+				if (Value != ExpectedValue)
+				{
+					AllAnchorsMatch = false;
+					break;
+				}
+			}
+
+			if (AllAnchorsMatch)
+				return Offset;
+		}
+
+		return OffsetNotFound;
 	}
 
 	template<bool bCheckForVft = true>

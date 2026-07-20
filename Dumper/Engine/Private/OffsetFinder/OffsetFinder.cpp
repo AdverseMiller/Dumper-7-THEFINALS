@@ -13,6 +13,11 @@
 
 #include "Platform.h"
 
+namespace
+{
+	std::vector<int32_t> DiscoveryChildPropertiesCandidates;
+}
+
 /* UObject */
 int32_t OffsetFinder::FindUObjectFlagsOffset()
 {
@@ -325,19 +330,13 @@ void OffsetFinder::InitDiscoveryFFieldLayout()
 	const std::uintptr_t ModuleEnd = ModuleBase + NtHeaders->OptionalHeader.SizeOfImage;
 	struct Decoder
 	{
-		std::uint32_t NameOffset;
-		std::uint32_t WordRotate;
-		std::uint32_t ResultRotate;
-		std::uint64_t XorKey;
-		std::array<std::uint8_t, 8> Shuffle;
-
-		bool operator<(const Decoder& Other) const
-		{
-			return std::tie(NameOffset, WordRotate, ResultRotate, XorKey, Shuffle) < std::tie(Other.NameOffset, Other.WordRotate, Other.ResultRotate, Other.XorKey, Other.Shuffle);
-		}
+		std::uint32_t NameOffset = 0;
+		std::uint8_t InputRegister = 0;
+		std::uint64_t ScalarXor = 0;
+		std::uint8_t ScalarRotate = 0;
+		std::vector<Discovery::ProtectedVectorInstruction> Instructions;
 	};
 
-	std::set<Decoder> Decoders;
 	std::vector<std::pair<const std::uint8_t*, std::size_t>> ReadableRanges;
 	const auto* Section = IMAGE_FIRST_SECTION(NtHeaders);
 	for (std::uint16_t SectionIndex = 0; SectionIndex < NtHeaders->FileHeader.NumberOfSections; ++SectionIndex, ++Section)
@@ -370,108 +369,325 @@ void OffsetFinder::InitDiscoveryFFieldLayout()
 		}
 	}
 
-	std::size_t DecoderImplementationMatches = 0;
-	std::size_t DecoderNameMatches = 0;
-	std::size_t DecoderControlMatches = 0;
-	std::size_t DecoderKeyMatches = 0;
+	const UEObject GuidObject = ObjectArray::FindObjectFast("Guid");
+	const UEObject VectorObject = ObjectArray::FindObjectFast("Vector");
+	const UEObject ColorObject = ObjectArray::FindObjectFast("Color");
+	if (!GuidObject || !VectorObject || !ColorObject)
+		throw std::runtime_error("Discovery FField decoder could not resolve validation structs");
+	if (DiscoveryChildPropertiesCandidates.empty())
+		DiscoveryChildPropertiesCandidates.push_back(Off::UStruct::ChildProperties);
+	if (DiscoveryChildPropertiesCandidates.empty())
+		throw std::runtime_error("Discovery FField decoder could not resolve validation fields");
+
+	auto ReadConstant = [&](const std::uint8_t* InstructionEnd, const std::int32_t Relative, std::array<std::uint8_t, 16>& Constant, const std::size_t Size)
+	{
+		const auto* Address = InstructionEnd + Relative;
+		if (Size > Constant.size() || reinterpret_cast<std::uintptr_t>(Address) < ModuleBase || reinterpret_cast<std::uintptr_t>(Address + Size) > ModuleEnd || Platform::IsBadReadPtr(Address + Size - 1))
+			return false;
+		Constant.fill(0);
+		std::memcpy(Constant.data(), Address, Size);
+		return true;
+	};
+
+	auto FindVectorConstant = [&](const std::uint8_t* Begin, const std::uint8_t* End, const std::uint8_t Register, std::array<std::uint8_t, 16>& Constant)
+	{
+		bool Found = false;
+		for (const std::uint8_t* Cursor = Begin; Cursor + 8 <= End; ++Cursor)
+		{
+			const std::uint8_t Prefix = *Cursor;
+			if (Prefix != 0x66 && Prefix != 0xF3)
+				continue;
+			const std::uint8_t* Instruction = Cursor + 1;
+			std::uint8_t Rex = 0;
+			if ((*Instruction & 0xF0) == 0x40)
+				Rex = *Instruction++;
+			if (Instruction + 7 > End || Instruction[0] != 0x0F || (Instruction[1] != 0x6F && Instruction[1] != 0x7E))
+				continue;
+			const std::uint8_t ModRm = Instruction[2];
+			const std::uint8_t Destination = ((ModRm >> 3) & 0x7) | ((Rex & 0x4) ? 0x8 : 0x0);
+			if (Destination != Register || (ModRm >> 6) != 0 || (ModRm & 0x7) != 5)
+				continue;
+			std::int32_t Relative = 0;
+			std::memcpy(&Relative, Instruction + 3, sizeof(Relative));
+			Found = ReadConstant(Instruction + 7, Relative, Constant, Prefix == 0xF3 || Instruction[1] == 0x7E ? 8 : 16);
+		}
+		return Found;
+	};
+
+	auto FindScalarImmediate = [](const std::uint8_t* Begin, const std::uint8_t* End, const std::uint8_t Register, std::uint64_t& Immediate)
+	{
+		bool Found = false;
+		for (const std::uint8_t* Cursor = Begin; Cursor + 10 <= End; ++Cursor)
+		{
+			const std::uint8_t Rex = Cursor[0];
+			if ((Rex & 0xF8) != 0x48 || Cursor[1] < 0xB8 || Cursor[1] > 0xBF)
+				continue;
+			const std::uint8_t Destination = (Cursor[1] - 0xB8) | ((Rex & 0x1) ? 0x8 : 0x0);
+			if (Destination != Register)
+				continue;
+			std::memcpy(&Immediate, Cursor + 2, sizeof(Immediate));
+			Found = true;
+		}
+		return Found;
+	};
+
+	auto ParseDecoder = [&](const std::uint8_t* Load, const std::uint8_t* RangeBegin, const std::uint8_t* RangeEnd, Decoder& Result)
+	{
+		const std::uint8_t* Cursor = Load;
+		if (Cursor >= RangeEnd || *Cursor++ != 0x66)
+			return false;
+		std::uint8_t Rex = 0;
+		if (Cursor < RangeEnd && (*Cursor & 0xF0) == 0x40)
+			Rex = *Cursor++;
+		if (Cursor + 4 > RangeEnd || Cursor[0] != 0x0F || Cursor[1] != 0x6F)
+			return false;
+		Cursor += 2;
+		const std::uint8_t LoadModRm = *Cursor++;
+		const std::uint8_t LoadMode = LoadModRm >> 6;
+		if (LoadMode != 1 && LoadMode != 2)
+			return false;
+		const std::uint8_t InputRegister = ((LoadModRm >> 3) & 0x7) | ((Rex & 0x4) ? 0x8 : 0x0);
+		std::int32_t NameOffset = 0;
+		if (LoadMode == 1)
+			NameOffset = static_cast<std::int8_t>(*Cursor++);
+		else
+		{
+			if (Cursor + 4 > RangeEnd)
+				return false;
+			std::memcpy(&NameOffset, Cursor, sizeof(NameOffset));
+			Cursor += 4;
+		}
+		if (NameOffset <= 0 || NameOffset > 0x100 || (NameOffset & 0x7))
+			return false;
+
+		Result = {};
+		Result.NameOffset = static_cast<std::uint32_t>(NameOffset);
+		Result.InputRegister = InputRegister;
+		std::array<bool, 16> DefinedRegisters{};
+		DefinedRegisters[InputRegister] = true;
+		const std::uint8_t* PreludeBegin = Load - std::min<std::ptrdiff_t>(Load - RangeBegin, 0x80);
+
+		while (Cursor < RangeEnd && Result.Instructions.size() + 1 < Discovery::FieldNameProgram.size())
+		{
+			const std::uint8_t Prefix = *Cursor++;
+			if (Prefix != 0x66 && Prefix != 0xF2)
+				return false;
+			Rex = 0;
+			if (Cursor < RangeEnd && (*Cursor & 0xF0) == 0x40)
+				Rex = *Cursor++;
+			if (Cursor + 2 > RangeEnd || *Cursor++ != 0x0F)
+				return false;
+			bool ThreeByteOpcode = false;
+			std::uint8_t Opcode = *Cursor++;
+			if (Opcode == 0x38)
+			{
+				if (Cursor >= RangeEnd)
+					return false;
+				ThreeByteOpcode = true;
+				Opcode = *Cursor++;
+			}
+			if (Cursor >= RangeEnd)
+				return false;
+			const std::uint8_t ModRm = *Cursor++;
+			const std::uint8_t Mode = ModRm >> 6;
+			const std::uint8_t Register = ((ModRm >> 3) & 0x7) | ((Rex & 0x4) ? 0x8 : 0x0);
+			const std::uint8_t Rm = (ModRm & 0x7) | ((Rex & 0x1) ? 0x8 : 0x0);
+
+			if (!ThreeByteOpcode && Opcode == 0x7E && Prefix == 0x66 && (Rex & 0x8) && Mode == 3)
+			{
+				const std::uint8_t VectorOutput = Register;
+				std::uint8_t ScalarRegister = Rm;
+				bool FoundXor = false;
+				const std::uint8_t* ScalarEnd = std::min(RangeEnd, Cursor + 0x40);
+				for (const std::uint8_t* Scalar = Cursor; Scalar + 3 <= ScalarEnd; ++Scalar)
+				{
+					if ((Scalar[0] & 0xF8) != 0x48)
+						continue;
+					const std::uint8_t ScalarRex = Scalar[0];
+					if ((Scalar[1] == 0x31 || Scalar[1] == 0x33) && (Scalar[2] >> 6) == 3)
+					{
+						const std::uint8_t Reg = ((Scalar[2] >> 3) & 0x7) | ((ScalarRex & 0x4) ? 0x8 : 0x0);
+						const std::uint8_t RmRegister = (Scalar[2] & 0x7) | ((ScalarRex & 0x1) ? 0x8 : 0x0);
+						const std::uint8_t Destination = Scalar[1] == 0x31 ? RmRegister : Reg;
+						const std::uint8_t Source = Scalar[1] == 0x31 ? Reg : RmRegister;
+						const std::uint8_t ConstantRegister = Destination == ScalarRegister ? Source : (Source == ScalarRegister ? Destination : 0xFF);
+						std::uint64_t Immediate = 0;
+						if (ConstantRegister != 0xFF && FindScalarImmediate(PreludeBegin, Scalar, ConstantRegister, Immediate))
+						{
+							Result.ScalarXor = Immediate;
+							ScalarRegister = Destination;
+							FoundXor = true;
+						}
+					}
+					else if (FoundXor && Scalar[1] == 0xC1 && (Scalar[2] >> 6) == 3 && ((Scalar[2] >> 3) & 0x7) == 0)
+					{
+						const std::uint8_t Destination = (Scalar[2] & 0x7) | ((ScalarRex & 0x1) ? 0x8 : 0x0);
+						if (Destination == ScalarRegister && Scalar[3] > 0 && Scalar[3] < 64)
+						{
+							Result.ScalarRotate = Scalar[3];
+							Result.Instructions.push_back({
+								.Opcode = Discovery::ProtectedVectorOpcode::ReturnLowQword,
+								.Source = VectorOutput,
+							});
+							return true;
+						}
+					}
+				}
+				return false;
+			}
+
+			Discovery::ProtectedVectorInstruction Instruction{};
+			Instruction.Destination = Register;
+			Instruction.Source = Rm;
+			if (!ThreeByteOpcode && (Opcode == 0x71 || Opcode == 0x72 || Opcode == 0x73) && Mode == 3)
+			{
+				if (Cursor >= RangeEnd)
+					return false;
+				Instruction.Destination = Rm;
+				Instruction.Source = Rm;
+				Instruction.Immediate = *Cursor++;
+				const std::uint8_t Group = (ModRm >> 3) & 0x7;
+				if (Opcode == 0x71 && Group == 2)
+					Instruction.Opcode = Discovery::ProtectedVectorOpcode::ShiftRightWords;
+				else if (Opcode == 0x71 && Group == 6)
+					Instruction.Opcode = Discovery::ProtectedVectorOpcode::ShiftLeftWords;
+				else if (Opcode == 0x72 && Group == 2)
+					Instruction.Opcode = Discovery::ProtectedVectorOpcode::ShiftRightDwords;
+				else if (Opcode == 0x72 && Group == 6)
+					Instruction.Opcode = Discovery::ProtectedVectorOpcode::ShiftLeftDwords;
+				else if (Opcode == 0x73 && Group == 2)
+					Instruction.Opcode = Discovery::ProtectedVectorOpcode::ShiftRightQwords;
+				else if (Opcode == 0x73 && Group == 6)
+					Instruction.Opcode = Discovery::ProtectedVectorOpcode::ShiftLeftQwords;
+				else
+					return false;
+			}
+			else if (!ThreeByteOpcode && Opcode == 0x70 && Prefix == 0xF2 && Mode == 3)
+			{
+				if (Cursor >= RangeEnd)
+					return false;
+				Instruction.Opcode = Discovery::ProtectedVectorOpcode::ShuffleLowWords;
+				Instruction.Immediate = *Cursor++;
+			}
+			else
+			{
+				if (!ThreeByteOpcode && Opcode == 0x6F)
+					Instruction.Opcode = Discovery::ProtectedVectorOpcode::Move;
+				else if (!ThreeByteOpcode && Opcode == 0xEF)
+					Instruction.Opcode = Discovery::ProtectedVectorOpcode::Xor;
+				else if (!ThreeByteOpcode && Opcode == 0xFD)
+					Instruction.Opcode = Discovery::ProtectedVectorOpcode::AddWords;
+				else if (!ThreeByteOpcode && Opcode == 0xEB)
+					Instruction.Opcode = Discovery::ProtectedVectorOpcode::Or;
+				else if (!ThreeByteOpcode && Opcode == 0xDB)
+					Instruction.Opcode = Discovery::ProtectedVectorOpcode::And;
+				else if (!ThreeByteOpcode && Opcode == 0xDF)
+					Instruction.Opcode = Discovery::ProtectedVectorOpcode::AndNot;
+				else if (ThreeByteOpcode && Opcode == 0x00)
+					Instruction.Opcode = Discovery::ProtectedVectorOpcode::ShuffleBytes;
+				else
+					return false;
+
+				if (Mode == 0 && (ModRm & 0x7) == 5)
+				{
+					if (Cursor + 4 > RangeEnd)
+						return false;
+					std::int32_t Relative = 0;
+					std::memcpy(&Relative, Cursor, sizeof(Relative));
+					Cursor += 4;
+					Instruction.SourceIsConstant = true;
+					if (!ReadConstant(Cursor, Relative, Instruction.Constant, 16))
+						return false;
+				}
+				else if (Mode == 3)
+				{
+					if (!DefinedRegisters[Rm] && Rm != Register)
+					{
+						Instruction.SourceIsConstant = FindVectorConstant(PreludeBegin, Cursor, Rm, Instruction.Constant);
+						if (!Instruction.SourceIsConstant)
+							return false;
+					}
+				}
+				else
+					return false;
+			}
+
+			DefinedRegisters[Instruction.Destination] = true;
+			Result.Instructions.push_back(Instruction);
+		}
+		return false;
+	};
+
+	std::vector<Decoder> ValidDecoders;
+	std::size_t ExtractedPrograms = 0;
 	for (const auto& [Begin, Size] : ReadableRanges)
 	{
-		static constexpr std::uint8_t FinishDecode[] = { 0x66, 0x48, 0x0F, 0x7E, 0xC0, 0x48, 0x31, 0xD8, 0x48, 0xC1, 0xC0 };
-		for (std::size_t Offset = 0x80; Offset + 0x40 < Size; ++Offset)
+		for (std::size_t Offset = 0x80; Offset + 0x80 < Size; ++Offset)
 		{
-			const auto* Rotate = Begin + Offset;
-			if (std::memcmp(Rotate, "\x66\x0F\x71\xD1", 4) != 0 || std::memcmp(Rotate + 5, "\x66\x0F\x71\xF0", 4) != 0 || std::memcmp(Rotate + 10, "\x66\x0F\xEB\xC1", 4) != 0 || Rotate[4] + Rotate[9] != 16 || std::memcmp(Rotate + 14, FinishDecode, sizeof(FinishDecode)) != 0)
+			Decoder Candidate;
+			if (!ParseDecoder(Begin + Offset, Begin, Begin + Size, Candidate))
 				continue;
-			++DecoderImplementationMatches;
-
-			const std::uint32_t ResultRotate = Rotate[14 + sizeof(FinishDecode)];
-			if (!ResultRotate)
+			++ExtractedPrograms;
+			if (Candidate.Instructions.empty() || Candidate.Instructions.size() > Discovery::FieldNameProgram.size())
 				continue;
 
-			const std::uint8_t* ShuffleInstruction = nullptr;
-			for (const auto* Candidate = Rotate - 16; Candidate + 5 <= Rotate; ++Candidate)
+			Discovery::FieldNameOffset = Candidate.NameOffset;
+			Discovery::FieldNameInputRegister = Candidate.InputRegister;
+			Discovery::FieldNameProgramSize = static_cast<std::uint32_t>(Candidate.Instructions.size());
+			std::copy(Candidate.Instructions.begin(), Candidate.Instructions.end(), Discovery::FieldNameProgram.begin());
+			Discovery::FieldNameScalarXor = Candidate.ScalarXor;
+			Discovery::FieldNameScalarRotate = Candidate.ScalarRotate;
+
+			auto IsPlausibleName = [](const std::uint64_t Value)
 			{
-				if (std::memcmp(Candidate, "\x66\x0F\x38\x00\xC6", 5) == 0)
-					ShuffleInstruction = Candidate;
-			}
-			if (!ShuffleInstruction)
-				continue;
-
-			std::uint32_t NameOffset = 0;
-			for (const auto* Load = Rotate - 16; Load < ShuffleInstruction; ++Load)
+				return static_cast<std::uint32_t>(Value) > 0 && static_cast<std::uint32_t>(Value) < 0x04000000 && static_cast<std::uint32_t>(Value >> 32) < 0x00100000;
+			};
+			bool ValidatedAgainstKnownFields = false;
+			for (const int32_t HeadOffset : DiscoveryChildPropertiesCandidates)
 			{
-				if (Load[0] != 0x66)
+				const auto* GuidChild = *reinterpret_cast<const std::uint8_t* const*>(static_cast<const std::uint8_t*>(GuidObject.GetAddress()) + HeadOffset);
+				const auto* VectorChild = *reinterpret_cast<const std::uint8_t* const*>(static_cast<const std::uint8_t*>(VectorObject.GetAddress()) + HeadOffset);
+				const auto* ColorChild = *reinterpret_cast<const std::uint8_t* const*>(static_cast<const std::uint8_t*>(ColorObject.GetAddress()) + HeadOffset);
+				if (!GuidChild || !VectorChild || !ColorChild || Platform::IsBadReadPtr(GuidChild) || Platform::IsBadReadPtr(VectorChild) || Platform::IsBadReadPtr(ColorChild))
 					continue;
-				std::size_t Cursor = 1;
-				if ((Load[Cursor] & 0xF0) == 0x40)
-					++Cursor;
-				if (Load[Cursor] != 0x0F || Load[Cursor + 1] != 0x6F)
+				const std::uint64_t GuidRaw = Discovery::GetFieldName(GuidChild);
+				const std::uint64_t VectorRaw = Discovery::GetFieldName(VectorChild);
+				const std::uint64_t ColorRaw = Discovery::GetFieldName(ColorChild);
+				if (!IsPlausibleName(GuidRaw) || !IsPlausibleName(VectorRaw) || !IsPlausibleName(ColorRaw))
 					continue;
-				const std::uint8_t ModRm = Load[Cursor + 2];
-				if ((ModRm >> 6) == 1)
-					NameOffset = Load[Cursor + 3];
-				else if ((ModRm >> 6) == 2)
-					std::memcpy(&NameOffset, Load + Cursor + 3, sizeof(NameOffset));
+				const std::string GuidName = FName(GuidRaw).ToString();
+				const std::string VectorName = FName(VectorRaw).ToString();
+				const std::string ColorName = FName(ColorRaw).ToString();
+				if ((GuidName == "A" || GuidName == "B" || GuidName == "C" || GuidName == "D") && (VectorName == "X" || VectorName == "Y" || VectorName == "Z") && (ColorName == "A" || ColorName == "B" || ColorName == "G" || ColorName == "R"))
+				{
+					ValidatedAgainstKnownFields = true;
+					break;
+				}
 			}
-			if (NameOffset)
-				++DecoderNameMatches;
-
-			const std::uint8_t* Control = nullptr;
-			for (const auto* Instruction = Rotate - 0x80; Instruction + 8 <= ShuffleInstruction; ++Instruction)
-			{
-				if (Instruction[0] != 0xF3 || Instruction[1] != 0x0F || Instruction[2] != 0x7E || (Instruction[3] & 0xC7) != 0x05)
-					continue;
-				std::int32_t Relative = 0;
-				std::memcpy(&Relative, Instruction + 4, sizeof(Relative));
-				const auto* Candidate = Instruction + 8 + Relative;
-				if (reinterpret_cast<std::uintptr_t>(Candidate) >= ModuleBase && reinterpret_cast<std::uintptr_t>(Candidate + 7) < ModuleEnd && !Platform::IsBadReadPtr(Candidate + 7))
-					Control = Candidate;
-			}
-			if (Control)
-				++DecoderControlMatches;
-
-			std::uint64_t XorKey = 0;
-			for (const auto* Instruction = Rotate - 0x80; Instruction + 10 <= Rotate; ++Instruction)
-			{
-				if (Instruction[0] == 0x48 && Instruction[1] == 0xBB)
-					std::memcpy(&XorKey, Instruction + 2, sizeof(XorKey));
-			}
-			if (XorKey)
-				++DecoderKeyMatches;
-
-			if (!NameOffset || !Control || !XorKey)
-				continue;
-
-			Decoder Candidate{ NameOffset, Rotate[9], ResultRotate, XorKey, {} };
-			std::memcpy(Candidate.Shuffle.data(), Control, Candidate.Shuffle.size());
-			Decoders.insert(Candidate);
+			if (ValidatedAgainstKnownFields)
+				ValidDecoders.push_back(std::move(Candidate));
 		}
 	}
 
-	if (Decoders.size() != 1)
-		throw std::runtime_error(std::format("Discovery FField name decoder matched {} parameter sets from {} implementations across {} ranges (name {}, control {}, key {})", Decoders.size(), DecoderImplementationMatches, ReadableRanges.size(), DecoderNameMatches, DecoderControlMatches, DecoderKeyMatches));
-
-	const Decoder& Selected = *Decoders.begin();
+	if (ValidDecoders.empty())
+		throw std::runtime_error(std::format("Discovery FField instruction extractor validated no decoders from {} extracted programs across {} ranges", ExtractedPrograms, ReadableRanges.size()));
+	const auto SelectedIterator = std::min_element(ValidDecoders.begin(), ValidDecoders.end(), [](const Decoder& Left, const Decoder& Right)
+	{
+		return Left.Instructions.size() < Right.Instructions.size();
+	});
+	const Decoder& Selected = *SelectedIterator;
 	Discovery::FieldNameOffset = Selected.NameOffset;
-	Discovery::FieldNameWordRotate = Selected.WordRotate;
-	Discovery::FieldNameResultRotate = Selected.ResultRotate;
-	Discovery::FieldNameXorKey = Selected.XorKey;
-	Discovery::FieldNameShuffle = Selected.Shuffle;
+	Discovery::FieldNameInputRegister = Selected.InputRegister;
+	Discovery::FieldNameProgramSize = static_cast<std::uint32_t>(Selected.Instructions.size());
+	std::copy(Selected.Instructions.begin(), Selected.Instructions.end(), Discovery::FieldNameProgram.begin());
+	Discovery::FieldNameScalarXor = Selected.ScalarXor;
+	Discovery::FieldNameScalarRotate = Selected.ScalarRotate;
 	Discovery::FieldNameDecoderReady = true;
+	std::cerr << std::format("Discovery FField instruction decoder recovered: name +0x{:X}, input xmm{}, {} vector instructions, scalar xor 0x{:016X}, rotl {} ({} validated implementations)\n", Selected.NameOffset, Selected.InputRegister, Selected.Instructions.size(), Selected.ScalarXor, Selected.ScalarRotate, ValidDecoders.size());
 
-	const UEStruct Guid = ObjectArray::FindStructFast("Guid");
-	const UEStruct Vector = ObjectArray::FindStructFast("Vector");
-	const UEStruct Color = ObjectArray::FindStructFast("Color");
-	const auto* GuidChild = static_cast<const std::uint8_t*>(Guid.GetChildProperties().GetAddress());
-	const auto* VectorChild = static_cast<const std::uint8_t*>(Vector.GetChildProperties().GetAddress());
-	const auto* ColorChild = static_cast<const std::uint8_t*>(Color.GetChildProperties().GetAddress());
-	if (!GuidChild || !VectorChild || !ColorChild)
-		throw std::runtime_error("Discovery FField layout validation could not read known child-property chains");
-
-	const std::string GuidName = FName(Discovery::GetFieldName(GuidChild)).ToString();
-	const std::string VectorName = FName(Discovery::GetFieldName(VectorChild)).ToString();
-	if ((GuidName != "A" && GuidName != "D") || (VectorName != "X" && VectorName != "Z"))
-		throw std::runtime_error(std::format("Discovery FField name decoder failed known-name validation: Guid={}, Vector={}", GuidName, VectorName));
+	const UEStruct Guid = GuidObject.Cast<UEStruct>();
+	const UEStruct Vector = VectorObject.Cast<UEStruct>();
+	const UEStruct Color = ColorObject.Cast<UEStruct>();
 
 	auto IsField = [&](const std::uint8_t* Field)
 	{
@@ -480,55 +696,330 @@ void OffsetFinder::InitDiscoveryFFieldLayout()
 		const std::uintptr_t Vft = *reinterpret_cast<const std::uintptr_t*>(Field);
 		return Vft >= ModuleBase && Vft < ModuleEnd;
 	};
-	auto ChainLength = [&](const std::uint8_t* Field, const int32 Offset)
+	auto ReadChain = [&](const std::uint8_t* Field, const int32 Offset)
 	{
-		int Length = 0;
-		std::array<const std::uint8_t*, 16> Seen{};
-		while (Field && Length < static_cast<int>(Seen.size()))
+		std::vector<const std::uint8_t*> Chain;
+		while (Field && Chain.size() < 512)
 		{
-			if (!IsField(Field) || std::find(Seen.begin(), Seen.begin() + Length, Field) != Seen.begin() + Length)
-				return -1;
-			Seen[Length++] = Field;
+			if (!IsField(Field) || std::find(Chain.begin(), Chain.end(), Field) != Chain.end() || Platform::IsBadReadPtr(Field + Offset))
+				return std::vector<const std::uint8_t*>{};
+			Chain.push_back(Field);
 			Field = *reinterpret_cast<const std::uint8_t* const*>(Field + Offset);
 		}
-		return Field ? -1 : Length;
+		return Field ? std::vector<const std::uint8_t*>{} : Chain;
+	};
+	auto HasExpectedNames = [&](const std::vector<const std::uint8_t*>& Chain, const std::set<std::string>& Expected)
+	{
+		if (Chain.size() != Expected.size())
+			return false;
+		std::set<std::string> Names;
+		for (const std::uint8_t* Field : Chain)
+		{
+			const std::string Name = FName(Discovery::GetFieldName(Field)).ToString();
+			if (!Expected.contains(Name))
+				return false;
+			Names.insert(Name);
+		}
+		return Names == Expected;
 	};
 
-	std::vector<int32> NextCandidates;
-	for (int32 Offset = 0x8; Offset < 0x90; Offset += sizeof(void*))
+	struct SemanticCandidate
 	{
-		if (ChainLength(GuidChild, Offset) == 4 && ChainLength(VectorChild, Offset) == 3 && ChainLength(ColorChild, Offset) == 4)
-			NextCandidates.push_back(Offset);
-	}
-	if (NextCandidates.size() != 1)
-		throw std::runtime_error(std::format("Discovery FField::Next matched {} offsets", NextCandidates.size()));
-	Off::FField::Next = NextCandidates[0];
+		int32 Head = OffsetNotFound;
+		int32 Next = OffsetNotFound;
+		int32 Owner = OffsetNotFound;
+		int StructMatches = 0;
+		int FieldMatches = 0;
+		int References = 0;
+	};
+	std::vector<SemanticCandidate> SemanticCandidates;
+	const std::array<const std::uint8_t*, 3> StructAddresses{
+		static_cast<const std::uint8_t*>(Color.GetAddress()),
+		static_cast<const std::uint8_t*>(Guid.GetAddress()),
+		static_cast<const std::uint8_t*>(Vector.GetAddress()),
+	};
+	const std::array<std::set<std::string>, 3> ExpectedNames{
+		std::set<std::string>{ "A", "B", "G", "R" },
+		std::set<std::string>{ "A", "B", "C", "D" },
+		std::set<std::string>{ "X", "Y", "Z" },
+	};
+	for (const int32 HeadOffset : DiscoveryChildPropertiesCandidates)
+	{
+		std::array<const std::uint8_t*, 3> Heads{};
+		for (std::size_t Index = 0; Index < Heads.size(); ++Index)
+			Heads[Index] = *reinterpret_cast<const std::uint8_t* const*>(StructAddresses[Index] + HeadOffset);
+		for (int32 NextOffset = 0x8; NextOffset < 0x200; NextOffset += sizeof(void*))
+		{
+			std::array<std::vector<const std::uint8_t*>, 3> Chains;
+			bool NamesMatch = true;
+			for (std::size_t Index = 0; Index < Chains.size(); ++Index)
+			{
+				Chains[Index] = ReadChain(Heads[Index], NextOffset);
+				if (!HasExpectedNames(Chains[Index], ExpectedNames[Index]))
+				{
+					NamesMatch = false;
+					break;
+				}
+			}
+			if (!NamesMatch)
+				continue;
 
-	std::vector<int32> OwnerCandidates;
-	for (int32 Offset = 0x8; Offset < 0x90; Offset += sizeof(void*))
-	{
-		const std::uintptr_t GuidOwner = *reinterpret_cast<const std::uintptr_t*>(GuidChild + Offset) & ~1ull;
-		const std::uintptr_t VectorOwner = *reinterpret_cast<const std::uintptr_t*>(VectorChild + Offset) & ~1ull;
-		const std::uintptr_t ColorOwner = *reinterpret_cast<const std::uintptr_t*>(ColorChild + Offset) & ~1ull;
-		if (GuidOwner == reinterpret_cast<std::uintptr_t>(Guid.GetAddress()) && VectorOwner == reinterpret_cast<std::uintptr_t>(Vector.GetAddress()) && ColorOwner == reinterpret_cast<std::uintptr_t>(Color.GetAddress()))
-			OwnerCandidates.push_back(Offset);
+			std::vector<int32> OwnerCandidates;
+			for (int32 OwnerOffset = 0x8; OwnerOffset < 0x200; OwnerOffset += sizeof(void*))
+			{
+				bool OwnersMatch = true;
+				for (std::size_t StructIndex = 0; StructIndex < Chains.size() && OwnersMatch; ++StructIndex)
+				{
+					for (const std::uint8_t* Field : Chains[StructIndex])
+					{
+						if (Platform::IsBadReadPtr(Field + OwnerOffset) || ((*reinterpret_cast<const std::uintptr_t*>(Field + OwnerOffset) & ~1ull) != reinterpret_cast<std::uintptr_t>(StructAddresses[StructIndex])))
+						{
+							OwnersMatch = false;
+							break;
+						}
+					}
+				}
+				if (OwnersMatch)
+					OwnerCandidates.push_back(OwnerOffset);
+			}
+			if (OwnerCandidates.size() == 1)
+				SemanticCandidates.push_back({ HeadOffset, NextOffset, OwnerCandidates[0] });
+		}
 	}
-	if (OwnerCandidates.size() != 1)
-		throw std::runtime_error(std::format("Discovery FField::Owner matched {} offsets", OwnerCandidates.size()));
-	Off::FField::Owner = OwnerCandidates[0];
+
+	std::sort(SemanticCandidates.begin(), SemanticCandidates.end(), [](const SemanticCandidate& Left, const SemanticCandidate& Right)
+	{
+		return std::tie(Left.Head, Left.Next, Left.Owner) < std::tie(Right.Head, Right.Next, Right.Owner);
+	});
+	SemanticCandidates.erase(std::unique(SemanticCandidates.begin(), SemanticCandidates.end(), [](const SemanticCandidate& Left, const SemanticCandidate& Right)
+	{
+		return Left.Head == Right.Head && Left.Next == Right.Next && Left.Owner == Right.Owner;
+	}), SemanticCandidates.end());
+
+	for (SemanticCandidate& Candidate : SemanticCandidates)
+	{
+		int StructsInspected = 0;
+		for (const UEObject Object : ObjectArray())
+		{
+			if (StructsInspected >= 1024)
+				break;
+			if (!Object || !Object.IsA(EClassCastFlags::Struct))
+				continue;
+			++StructsInspected;
+			const auto* StructAddress = static_cast<const std::uint8_t*>(Object.GetAddress());
+			if (Platform::IsBadReadPtr(StructAddress + Candidate.Head))
+				continue;
+			const auto* Head = *reinterpret_cast<const std::uint8_t* const*>(StructAddress + Candidate.Head);
+			if (!Head)
+				continue;
+			const auto Chain = ReadChain(Head, Candidate.Next);
+			if (Chain.empty())
+				continue;
+
+			bool Valid = true;
+			std::set<std::uint64_t> Names;
+			for (const std::uint8_t* Field : Chain)
+			{
+				if (Platform::IsBadReadPtr(Field + Candidate.Owner) || ((*reinterpret_cast<const std::uintptr_t*>(Field + Candidate.Owner) & ~1ull) != reinterpret_cast<std::uintptr_t>(StructAddress)))
+				{
+					Valid = false;
+					break;
+				}
+				const std::uint64_t Name = Discovery::GetFieldName(Field);
+				if (static_cast<std::uint32_t>(Name) == 0 || static_cast<std::uint32_t>(Name) >= 0x04000000 || static_cast<std::uint32_t>(Name >> 32) >= 0x00100000 || !Names.insert(Name).second)
+				{
+					Valid = false;
+					break;
+				}
+			}
+			if (Valid)
+			{
+				++Candidate.StructMatches;
+				Candidate.FieldMatches += static_cast<int>(Chain.size());
+			}
+		}
+	}
+	if (SemanticCandidates.size() > 1)
+	{
+		const auto BestSemanticScore = std::max_element(SemanticCandidates.begin(), SemanticCandidates.end(), [](const SemanticCandidate& Left, const SemanticCandidate& Right)
+		{
+			return std::tie(Left.StructMatches, Left.FieldMatches) < std::tie(Right.StructMatches, Right.FieldMatches);
+		});
+		const int BestStructMatches = BestSemanticScore->StructMatches;
+		const int BestFieldMatches = BestSemanticScore->FieldMatches;
+		std::erase_if(SemanticCandidates, [&](const SemanticCandidate& Candidate)
+		{
+			return Candidate.StructMatches != BestStructMatches || Candidate.FieldMatches != BestFieldMatches;
+		});
+	}
+
+	auto FindDisplacementReferences = [](const std::uint8_t* Begin, const std::uint8_t* End, const int32 Displacement)
+	{
+		std::vector<std::size_t> References;
+		const std::size_t Size = static_cast<std::size_t>(End - Begin);
+		if (Size < 8 || Size > 0x10000)
+			return References;
+		std::vector<std::uint8_t> Bytes(Size);
+		SIZE_T BytesRead = 0;
+		if (!ReadProcessMemory(GetCurrentProcess(), Begin, Bytes.data(), Bytes.size(), &BytesRead) || BytesRead != Bytes.size())
+			return References;
+		const std::uint8_t* BufferBegin = Bytes.data();
+		const std::uint8_t* BufferEnd = BufferBegin + Bytes.size();
+		for (const std::uint8_t* Cursor = BufferBegin; Cursor + 8 <= BufferEnd; ++Cursor)
+		{
+			const std::uint8_t* Instruction = Cursor;
+			while (Instruction < BufferEnd && (*Instruction == 0x66 || *Instruction == 0xF2 || *Instruction == 0xF3))
+				++Instruction;
+			if (Instruction < BufferEnd && (*Instruction & 0xF0) == 0x40)
+				++Instruction;
+			if (Instruction >= BufferEnd)
+				continue;
+			const std::uint8_t Opcode = *Instruction++;
+			bool HasModRm = Opcode == 0x8B || Opcode == 0x89 || Opcode == 0x8D || Opcode == 0x39 || Opcode == 0x3B || Opcode == 0x85 || Opcode == 0x81 || Opcode == 0x83 || Opcode == 0xC7 || Opcode == 0xFF;
+			if (Opcode == 0x0F && Instruction < BufferEnd)
+			{
+				const std::uint8_t SecondOpcode = *Instruction++;
+				HasModRm = SecondOpcode == 0x10 || SecondOpcode == 0x11 || SecondOpcode == 0xB6 || SecondOpcode == 0xB7 || SecondOpcode == 0xBE || SecondOpcode == 0xBF;
+			}
+			if (!HasModRm || Instruction >= BufferEnd)
+				continue;
+			const std::uint8_t ModRm = *Instruction++;
+			const std::uint8_t Mode = ModRm >> 6;
+			if (Mode != 1 && Mode != 2)
+				continue;
+			if ((ModRm & 0x7) == 4)
+			{
+				if (Instruction >= BufferEnd)
+					continue;
+				++Instruction;
+			}
+			if (Mode == 1)
+			{
+				if (Instruction < BufferEnd && static_cast<int32>(static_cast<std::int8_t>(*Instruction)) == Displacement)
+					References.push_back(static_cast<std::size_t>(Cursor - BufferBegin));
+			}
+			else if (Instruction + sizeof(int32) <= BufferEnd)
+			{
+				int32 Value = 0;
+				std::memcpy(&Value, Instruction, sizeof(Value));
+				if (Value == Displacement)
+					References.push_back(static_cast<std::size_t>(Cursor - BufferBegin));
+			}
+		}
+		return References;
+	};
+
+	if (SemanticCandidates.size() > 1)
+	{
+		const IMAGE_DATA_DIRECTORY& ExceptionDirectory = NtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+		const auto* RuntimeFunctions = reinterpret_cast<const RUNTIME_FUNCTION*>(ModuleBase + ExceptionDirectory.VirtualAddress);
+		const std::size_t RuntimeFunctionCount = ExceptionDirectory.Size / sizeof(RUNTIME_FUNCTION);
+		for (SemanticCandidate& Candidate : SemanticCandidates)
+		{
+			for (std::size_t FunctionIndex = 0; FunctionIndex < RuntimeFunctionCount; ++FunctionIndex)
+			{
+				const auto* FunctionBegin = reinterpret_cast<const std::uint8_t*>(ModuleBase + RuntimeFunctions[FunctionIndex].BeginAddress);
+				const auto* FunctionEnd = reinterpret_cast<const std::uint8_t*>(ModuleBase + RuntimeFunctions[FunctionIndex].EndAddress);
+				if (FunctionBegin >= FunctionEnd || reinterpret_cast<std::uintptr_t>(FunctionEnd) > ModuleEnd)
+					continue;
+				const bool EntireFunctionIsReadable = std::any_of(ReadableRanges.begin(), ReadableRanges.end(), [&](const auto& Range)
+				{
+					return FunctionBegin >= Range.first && FunctionEnd <= Range.first + Range.second;
+				});
+				if (!EntireFunctionIsReadable)
+					continue;
+				const auto HeadReferences = FindDisplacementReferences(FunctionBegin, FunctionEnd, Candidate.Head);
+				if (HeadReferences.empty())
+					continue;
+				const auto NextReferences = FindDisplacementReferences(FunctionBegin, FunctionEnd, Candidate.Next);
+				bool PairFound = false;
+				for (const std::size_t HeadReference : HeadReferences)
+				{
+					for (const std::size_t NextReference : NextReferences)
+					{
+						const std::size_t Distance = HeadReference > NextReference ? HeadReference - NextReference : NextReference - HeadReference;
+						if (Distance <= 0x100)
+						{
+							PairFound = true;
+							break;
+						}
+					}
+					if (PairFound)
+						break;
+				}
+				if (PairFound)
+					++Candidate.References;
+			}
+		}
+	}
+
+	std::cerr << std::format("Discovery ChildProperties semantic scan matched {} head/link pairs", SemanticCandidates.size());
+	for (const SemanticCandidate& Candidate : SemanticCandidates)
+		std::cerr << std::format(" +0x{:X}/+0x{:X}/owner+0x{:X}/structs{}/fields{}/refs{}", Candidate.Head, Candidate.Next, Candidate.Owner, Candidate.StructMatches, Candidate.FieldMatches, Candidate.References);
+	std::cerr << '\n';
+	if (SemanticCandidates.size() > 1)
+	{
+		const int HighestReferenceCount = std::max_element(SemanticCandidates.begin(), SemanticCandidates.end(), [](const SemanticCandidate& Left, const SemanticCandidate& Right)
+		{
+			return Left.References < Right.References;
+		})->References;
+		std::erase_if(SemanticCandidates, [&](const SemanticCandidate& Candidate)
+		{
+			return Candidate.References != HighestReferenceCount;
+		});
+		if (HighestReferenceCount == 0 || SemanticCandidates.size() != 1)
+			throw std::runtime_error(std::format("Discovery ChildProperties remained ambiguous after semantic and executable-reference validation (best reference score {}, {} tied candidates)", HighestReferenceCount, SemanticCandidates.size()));
+	}
+	if (SemanticCandidates.size() != 1)
+		throw std::runtime_error(std::format("Discovery ChildProperties semantic scan matched {} candidates", SemanticCandidates.size()));
+
+	Off::UStruct::ChildProperties = SemanticCandidates[0].Head;
+	Off::FField::Next = SemanticCandidates[0].Next;
+	Off::FField::Owner = SemanticCandidates[0].Owner;
+	std::cerr << std::format("Discovery ChildProperties resolved semantically at +0x{:X} with FField::Next +0x{:X} and Owner +0x{:X}\n", Off::UStruct::ChildProperties, Off::FField::Next, Off::FField::Owner);
+
+	const auto* GuidChild = static_cast<const std::uint8_t*>(Guid.GetChildProperties().GetAddress());
+	const auto* VectorChild = static_cast<const std::uint8_t*>(Vector.GetChildProperties().GetAddress());
+	const auto* ColorChild = static_cast<const std::uint8_t*>(Color.GetChildProperties().GetAddress());
+	if (!GuidChild || !VectorChild || !ColorChild)
+		throw std::runtime_error("Discovery FField layout validation could not read known child-property chains");
+
+	const std::string GuidName = FName(Discovery::GetFieldName(GuidChild)).ToString();
+	const std::string VectorName = FName(Discovery::GetFieldName(VectorChild)).ToString();
+	if ((GuidName != "A" && GuidName != "B" && GuidName != "C" && GuidName != "D") || (VectorName != "X" && VectorName != "Y" && VectorName != "Z"))
+		throw std::runtime_error(std::format("Discovery FField name decoder failed known-name validation: Guid={}, Vector={}", GuidName, VectorName));
 
 	const std::uint64_t IntCast = static_cast<std::uint64_t>(EClassCastFlags::Field | EClassCastFlags::Property | EClassCastFlags::NumericProperty | EClassCastFlags::IntProperty);
 	const std::uint64_t ByteCast = static_cast<std::uint64_t>(EClassCastFlags::Field | EClassCastFlags::Property | EClassCastFlags::NumericProperty | EClassCastFlags::ByteProperty);
+	const std::uint64_t NumericCastMask = static_cast<std::uint64_t>(EClassCastFlags::Field | EClassCastFlags::Property | EClassCastFlags::NumericProperty);
+	const auto GuidChain = ReadChain(GuidChild, Off::FField::Next);
+	const auto ColorChain = ReadChain(ColorChild, Off::FField::Next);
+	const auto VectorChain = ReadChain(VectorChild, Off::FField::Next);
 	std::vector<std::pair<int32, int32>> ClassCandidates;
-	for (int32 ClassOffset = 0x8; ClassOffset < 0x90; ClassOffset += sizeof(void*))
+	for (int32 ClassOffset = 0x8; ClassOffset < 0x200; ClassOffset += sizeof(void*))
 	{
+		if (Platform::IsBadReadPtr(GuidChild + ClassOffset) || Platform::IsBadReadPtr(ColorChild + ClassOffset) || Platform::IsBadReadPtr(VectorChild + ClassOffset))
+			continue;
 		const auto* GuidClass = *reinterpret_cast<const std::uint8_t* const*>(GuidChild + ClassOffset);
 		const auto* ColorClass = *reinterpret_cast<const std::uint8_t* const*>(ColorChild + ClassOffset);
-		if (!GuidClass || GuidClass == ColorClass || reinterpret_cast<std::uintptr_t>(GuidClass) < ModuleBase || reinterpret_cast<std::uintptr_t>(GuidClass) >= ModuleEnd || reinterpret_cast<std::uintptr_t>(ColorClass) < ModuleBase || reinterpret_cast<std::uintptr_t>(ColorClass) >= ModuleEnd)
+		const auto* VectorClass = *reinterpret_cast<const std::uint8_t* const*>(VectorChild + ClassOffset);
+		if (!GuidClass || GuidClass == ColorClass || GuidClass == VectorClass || ColorClass == VectorClass || reinterpret_cast<std::uintptr_t>(GuidClass) < ModuleBase || reinterpret_cast<std::uintptr_t>(GuidClass) >= ModuleEnd || reinterpret_cast<std::uintptr_t>(ColorClass) < ModuleBase || reinterpret_cast<std::uintptr_t>(ColorClass) >= ModuleEnd || reinterpret_cast<std::uintptr_t>(VectorClass) < ModuleBase || reinterpret_cast<std::uintptr_t>(VectorClass) >= ModuleEnd)
 			continue;
-		for (int32 CastOffset = 0; CastOffset < 0x80; CastOffset += sizeof(std::uint64_t))
+		for (int32 CastOffset = 0; CastOffset < 0x180; CastOffset += sizeof(std::uint64_t))
 		{
-			if (*reinterpret_cast<const std::uint64_t*>(GuidClass + CastOffset) == IntCast && *reinterpret_cast<const std::uint64_t*>(ColorClass + CastOffset) == ByteCast)
+			if (Platform::IsBadReadPtr(GuidClass + CastOffset) || Platform::IsBadReadPtr(ColorClass + CastOffset) || Platform::IsBadReadPtr(VectorClass + CastOffset))
+				continue;
+			const std::uint64_t VectorCast = *reinterpret_cast<const std::uint64_t*>(VectorClass + CastOffset);
+			if (*reinterpret_cast<const std::uint64_t*>(GuidClass + CastOffset) != IntCast || *reinterpret_cast<const std::uint64_t*>(ColorClass + CastOffset) != ByteCast || (VectorCast & NumericCastMask) != NumericCastMask)
+				continue;
+			auto ChainUsesClass = [&](const std::vector<const std::uint8_t*>& Chain, const std::uint8_t* ExpectedClass)
+			{
+				return std::all_of(Chain.begin(), Chain.end(), [&](const std::uint8_t* Field)
+				{
+					return !Platform::IsBadReadPtr(Field + ClassOffset) && *reinterpret_cast<const std::uint8_t* const*>(Field + ClassOffset) == ExpectedClass;
+				});
+			};
+			if (ChainUsesClass(GuidChain, GuidClass) && ChainUsesClass(ColorChain, ColorClass) && ChainUsesClass(VectorChain, VectorClass))
 				ClassCandidates.emplace_back(ClassOffset, CastOffset);
 		}
 	}
@@ -537,14 +1028,16 @@ void OffsetFinder::InitDiscoveryFFieldLayout()
 	Off::FField::Class = ClassCandidates[0].first;
 	Off::FFieldClass::CastFlags = ClassCandidates[0].second;
 	Off::FField::Name = Discovery::FieldNameOffset;
-	Off::FField::Flags = Discovery::FieldNameOffset + 0x10;
+	Off::FField::Flags = OffsetFinder::OffsetNotFound;
 	Off::FFieldClass::Name = Discovery::FieldNameOffset;
 
 	const auto* IntClass = *reinterpret_cast<const std::uint8_t* const*>(GuidChild + Off::FField::Class);
 	const auto* ByteClass = *reinterpret_cast<const std::uint8_t* const*>(ColorChild + Off::FField::Class);
 	std::vector<int32> IdCandidates;
-	for (int32 Offset = 0; Offset < 0x90; Offset += sizeof(std::uint64_t))
+	for (int32 Offset = 0; Offset < 0x180; Offset += sizeof(std::uint64_t))
 	{
+		if (Platform::IsBadReadPtr(IntClass + Offset) || Platform::IsBadReadPtr(ByteClass + Offset))
+			continue;
 		if (*reinterpret_cast<const EFieldClassID*>(IntClass + Offset) == EFieldClassID::Int && *reinterpret_cast<const EFieldClassID*>(ByteClass + Offset) == EFieldClassID::Byte)
 			IdCandidates.push_back(Offset);
 	}
@@ -554,8 +1047,10 @@ void OffsetFinder::InitDiscoveryFFieldLayout()
 
 	const std::uint64_t NumericCast = static_cast<std::uint64_t>(EClassCastFlags::Field | EClassCastFlags::Property | EClassCastFlags::NumericProperty);
 	std::vector<int32> SuperCandidates;
-	for (int32 Offset = 0; Offset < 0x90; Offset += sizeof(void*))
+	for (int32 Offset = 0; Offset < 0x180; Offset += sizeof(void*))
 	{
+		if (Platform::IsBadReadPtr(IntClass + Offset) || Platform::IsBadReadPtr(ByteClass + Offset))
+			continue;
 		const auto* IntSuper = *reinterpret_cast<const std::uint8_t* const*>(IntClass + Offset);
 		const auto* ByteSuper = *reinterpret_cast<const std::uint8_t* const*>(ByteClass + Offset);
 		if (!IntSuper || IntSuper != ByteSuper || reinterpret_cast<std::uintptr_t>(IntSuper) < ModuleBase || reinterpret_cast<std::uintptr_t>(IntSuper) >= ModuleEnd)
@@ -1029,11 +1524,116 @@ int32_t OffsetFinder::FindChildOffset()
 
 int32_t OffsetFinder::FindChildPropertiesOffset()
 {
-	const void* ObjA = ObjectArray::FindStructFast("Color").GetAddress();
-	const void* ObjB = ObjectArray::FindStructFast("Guid").GetAddress();
+	const void* ObjA = ObjectArray::FindObjectFast("Color").GetAddress();
+	const void* ObjB = ObjectArray::FindObjectFast("Guid").GetAddress();
 
-	const int32_t SearchEnd = Discovery::Enabled ? 0x120 : 0x80;
-	return GetValidPointerOffset(ObjA, ObjB, Off::UStruct::Children + 0x08, SearchEnd);
+	if (!Discovery::Enabled)
+		return GetValidPointerOffset(ObjA, ObjB, Off::UStruct::Children + 0x08, 0x80);
+
+	const void* ObjC = ObjectArray::FindObjectFast("Vector").GetAddress();
+	if (!ObjA || !ObjB || !ObjC || Off::UStruct::SuperStruct == OffsetNotFound || Off::UStruct::Size == OffsetNotFound)
+	{
+		std::cerr << std::format("Discovery ChildProperties prerequisites failed: Color=0x{:X}, Guid=0x{:X}, Vector=0x{:X}, SuperStruct=0x{:X}, PropertiesSize=0x{:X}\n", reinterpret_cast<uintptr_t>(ObjA), reinterpret_cast<uintptr_t>(ObjB), reinterpret_cast<uintptr_t>(ObjC), Off::UStruct::SuperStruct, Off::UStruct::Size);
+		return OffsetNotFound;
+	}
+
+	const std::array<const uint8_t*, 3> Structs{
+		static_cast<const uint8_t*>(ObjA),
+		static_cast<const uint8_t*>(ObjB),
+		static_cast<const uint8_t*>(ObjC),
+	};
+	std::vector<int32_t> Candidates;
+	const int32_t SearchStart = 0x40;
+	const int32_t HighestKnownMember = (std::max)({ Off::UStruct::Children, Off::UStruct::Size, Off::UStruct::MinAlignment });
+	const int32_t SearchEnd = (std::min)(Align(HighestKnownMember + 0x100, static_cast<int32_t>(sizeof(void*))), 0x300);
+	for (int32_t Offset = SearchStart; Offset < SearchEnd; Offset += sizeof(void*))
+	{
+		std::array<const void*, 3> Fields{};
+		bool IsCandidate = true;
+		for (std::size_t Index = 0; Index < Structs.size(); ++Index)
+		{
+			Fields[Index] = *reinterpret_cast<const void* const*>(Structs[Index] + Offset);
+			if (!Fields[Index] || (reinterpret_cast<uintptr_t>(Fields[Index]) & (alignof(void*) - 1)) || Platform::IsBadReadPtr(Fields[Index]))
+			{
+				IsCandidate = false;
+				break;
+			}
+
+			const void* Vft = *reinterpret_cast<const void* const*>(Fields[Index]);
+			if (!Platform::IsAddressInProcessRange(Vft))
+			{
+				IsCandidate = false;
+				break;
+			}
+		}
+
+		if (IsCandidate && Fields[0] != Fields[1] && Fields[0] != Fields[2] && Fields[1] != Fields[2])
+			Candidates.push_back(Offset);
+	}
+	std::cerr << std::format("Discovery ChildProperties pointer scan found {} candidate offsets", Candidates.size());
+	for (const int32_t Offset : Candidates)
+	{
+		const auto* ColorField = *reinterpret_cast<const void* const*>(Structs[0] + Offset);
+		const auto* GuidField = *reinterpret_cast<const void* const*>(Structs[1] + Offset);
+		const auto* VectorField = *reinterpret_cast<const void* const*>(Structs[2] + Offset);
+		std::cerr << std::format(" +0x{:X}[0x{:X}/0x{:X}/0x{:X}]", Offset, reinterpret_cast<std::uintptr_t>(ColorField), reinterpret_cast<std::uintptr_t>(GuidField), reinterpret_cast<std::uintptr_t>(VectorField));
+	}
+	std::cerr << '\n';
+
+	auto IsField = [](const uint8_t* Field)
+	{
+		if (!Field || (reinterpret_cast<uintptr_t>(Field) & (alignof(void*) - 1)) || Platform::IsBadReadPtr(Field))
+			return false;
+		return Platform::IsAddressInProcessRange(*reinterpret_cast<const void* const*>(Field));
+	};
+	auto ChainLength = [&](const uint8_t* Field, const int32_t NextOffset)
+	{
+		int32_t Length = 0;
+		std::array<const uint8_t*, 16> Seen{};
+		while (Field && Length < static_cast<int32_t>(Seen.size()))
+		{
+			if (!IsField(Field) || std::find(Seen.begin(), Seen.begin() + Length, Field) != Seen.begin() + Length)
+				return -1;
+			Seen[Length++] = Field;
+			Field = *reinterpret_cast<const uint8_t* const*>(Field + NextOffset);
+		}
+		return Field ? -1 : Length;
+	};
+
+	std::vector<int32_t> ChainValidatedCandidates;
+	for (const int32_t Candidate : Candidates)
+	{
+		const auto* ColorField = *reinterpret_cast<const uint8_t* const*>(Structs[0] + Candidate);
+		const auto* GuidField = *reinterpret_cast<const uint8_t* const*>(Structs[1] + Candidate);
+		const auto* VectorField = *reinterpret_cast<const uint8_t* const*>(Structs[2] + Candidate);
+		for (int32_t NextOffset = sizeof(void*); NextOffset < 0x180; NextOffset += sizeof(void*))
+		{
+			const int32_t ColorLength = ChainLength(ColorField, NextOffset);
+			const int32_t GuidLength = ChainLength(GuidField, NextOffset);
+			const int32_t VectorLength = ChainLength(VectorField, NextOffset);
+			if (ColorLength > 0 && GuidLength > 0 && VectorLength > 0)
+				std::cerr << std::format("Discovery FField topology candidate: UStruct +0x{:X}, Next +0x{:X}, lengths {}/{}/{}\n", Candidate, NextOffset, ColorLength, GuidLength, VectorLength);
+			if (ColorLength == 4 && GuidLength == 4 && VectorLength == 3)
+			{
+				ChainValidatedCandidates.push_back(Candidate);
+				break;
+			}
+		}
+	}
+	Candidates = std::move(ChainValidatedCandidates);
+
+	if (Candidates.empty())
+	{
+		std::cerr << std::format("Discovery ChildProperties structural scan matched {} offsets in bounded UStruct range +0x{:X}..+0x{:X}", Candidates.size(), SearchStart, SearchEnd);
+		for (const int32_t Offset : Candidates)
+			std::cerr << std::format(" +0x{:X}", Offset);
+		std::cerr << '\n';
+		return OffsetNotFound;
+	}
+
+	DiscoveryChildPropertiesCandidates = Candidates;
+	std::cerr << std::format("Discovery ChildProperties retained {} structural candidates for semantic resolution; provisional head +0x{:X}\n", Candidates.size(), Candidates[0]);
+	return Candidates[0];
 }
 
 int32_t OffsetFinder::FindStructSizeOffset()
@@ -1049,6 +1649,22 @@ int32_t OffsetFinder::FindStructSizeOffset()
 int32_t OffsetFinder::FindMinAlignmentOffset()
 {
 	std::vector<std::pair<void*, int16_t>> Infos;
+
+	if (Discovery::Enabled)
+	{
+		Infos.push_back({ ObjectArray::FindObjectFast("Guid").GetAddress(), 0x04 });
+		Infos.push_back({ ObjectArray::FindObjectFast("Transform").GetAddress(), 0x10 });
+		const int32_t SearchStart = Align(Off::UStruct::SuperStruct + static_cast<int32_t>(sizeof(void*)), 2);
+		const int32_t SearchEnd = Off::UClass::CastFlags > SearchStart ? Off::UClass::CastFlags : 0x300;
+		const int32_t Offset = FindOffset<2>(Infos, SearchStart, SearchEnd);
+		if (Offset != OffsetNotFound)
+		{
+			const void* Color = ObjectArray::FindObjectFast("Color").GetAddress();
+			const int16_t ColorAlignment = Color ? *reinterpret_cast<const int16_t*>(static_cast<const uint8_t*>(Color) + Offset) : 0;
+			std::cerr << std::format("Discovery UStruct minimum alignment recovered from Guid/Transform at +0x{:X}; Color reports 0x{:X}\n", Offset, ColorAlignment);
+		}
+		return Offset;
+	}
 
 	Infos.push_back({ ObjectArray::FindObjectFast("Transform").GetAddress(), 0x10 });
 
@@ -1222,6 +1838,45 @@ int32_t OffsetFinder::FindCastFlagsOffset()
 
 	Infos.push_back({ ObjectArray::FindObjectFast("Actor").GetAddress(), EClassCastFlags::Actor });
 	Infos.push_back({ ObjectArray::FindObjectFast("Class").GetAddress(), EClassCastFlags::Field | EClassCastFlags::Struct | EClassCastFlags::Class });
+	if (Discovery::Enabled)
+	{
+		Infos.push_back({ ObjectArray::FindObjectFast("Struct").GetAddress(), EClassCastFlags::Field | EClassCastFlags::Struct });
+		Infos.push_back({ ObjectArray::FindObjectFast("Field").GetAddress(), EClassCastFlags::Field });
+		for (const auto& [Object, _] : Infos)
+		{
+			if (!Object)
+				return OffsetNotFound;
+		}
+
+		std::vector<std::pair<int32_t, uint64_t>> Candidates;
+		for (int32_t Offset = 0xA0; Offset < 0x300; Offset += sizeof(uint64_t))
+		{
+			const uint64_t FirstRaw = *reinterpret_cast<const uint64_t*>(static_cast<const uint8_t*>(Infos[0].first) + Offset);
+			const uint64_t CandidateKey = FirstRaw ^ static_cast<uint64_t>(Infos[0].second);
+			bool MatchesAll = true;
+			for (const auto& [Object, ExpectedFlags] : Infos)
+			{
+				const uint64_t Raw = *reinterpret_cast<const uint64_t*>(static_cast<const uint8_t*>(Object) + Offset);
+				if ((Raw ^ CandidateKey) != static_cast<uint64_t>(ExpectedFlags))
+				{
+					MatchesAll = false;
+					break;
+				}
+			}
+			if (MatchesAll)
+				Candidates.push_back({ Offset, CandidateKey });
+		}
+
+		if (Candidates.size() != 1)
+		{
+			std::cerr << std::format("Discovery UClass cast-flag XOR scan matched {} candidate layouts\n", Candidates.size());
+			return OffsetNotFound;
+		}
+
+		Discovery::ClassCastFlagsXorKey = Candidates[0].second;
+		std::cerr << std::format("Discovery UClass cast flags recovered at +0x{:X} with XOR key 0x{:016X}\n", Candidates[0].first, Candidates[0].second);
+		return Candidates[0].first;
+	}
 
 	return FindOffset(Infos);
 }
@@ -1413,6 +2068,62 @@ int32_t OffsetFinder::FindOffsetInternalOffset()
 /* BoolProperty */
 int32_t OffsetFinder::FindBoolPropertyBaseOffset()
 {
+	if (Discovery::Enabled)
+	{
+		std::vector<const uint8_t*> Properties;
+		for (const UEProperty Property : AllFieldIterator())
+		{
+			if (!Property || !Property.IsA(EClassCastFlags::BoolProperty))
+				continue;
+			Properties.push_back(static_cast<const uint8_t*>(Property.GetAddress()));
+			if (Properties.size() == 64)
+				break;
+		}
+
+		if (Properties.size() < 16)
+		{
+			std::cerr << std::format("Discovery FBoolProperty structural scan found only {} samples\n", Properties.size());
+			return OffsetNotFound;
+		}
+
+		auto IsPowerOfTwo = [](const uint8_t Value)
+		{
+			return Value && !(Value & (Value - 1));
+		};
+		std::vector<int32_t> Candidates;
+		for (int32_t Offset = Align(Off::Property::ElementSize + static_cast<int32_t>(sizeof(int32_t)), 4); Offset < 0x180; ++Offset)
+		{
+			bool MatchesAll = true;
+			for (const uint8_t* Property : Properties)
+			{
+				const uint8_t FieldSize = Property[Offset];
+				const uint8_t ByteOffset = Property[Offset + 1];
+				const uint8_t ByteMask = Property[Offset + 2];
+				const uint8_t FieldMask = Property[Offset + 3];
+				const bool ValidFieldSize = FieldSize == 1 || FieldSize == 2 || FieldSize == 4 || FieldSize == 8;
+				if (!ValidFieldSize || ByteOffset >= FieldSize || !IsPowerOfTwo(ByteMask) || (FieldMask != 0xFF && (!IsPowerOfTwo(FieldMask) || FieldMask != ByteMask)))
+				{
+					MatchesAll = false;
+					break;
+				}
+			}
+			if (MatchesAll)
+				Candidates.push_back(Offset);
+		}
+
+		if (Candidates.size() != 1)
+		{
+			std::cerr << std::format("Discovery FBoolProperty structural scan matched {} candidate bases", Candidates.size());
+			for (const int32_t Offset : Candidates)
+				std::cerr << std::format(" +0x{:X}", Offset);
+			std::cerr << '\n';
+			return OffsetNotFound;
+		}
+
+		std::cerr << std::format("Discovery FBoolProperty base recovered structurally from {} fields at +0x{:X}\n", Properties.size(), Candidates[0]);
+		return Candidates[0];
+	}
+
 	std::vector<std::pair<void*, uint8_t>> Infos;
 
 	UEClass Engine = ObjectArray::FindClassFast("Engine");

@@ -15,10 +15,10 @@ namespace Settings
 		constexpr const char* DefaultModuleName = nullptr;
 	}
   
-	/* Wine exposes the Linux filesystem through Z:. Keep generated data out of
-	 * the game's Proton prefix so prefix maintenance does not mix with dumps. */
-	inline constexpr const char* DefaultOutputPath = "Z:/mnt/SteamLibrary/Dumper-7/Discovery";
-	inline constexpr const char* GlobalConfigPath = "Z:/mnt/SteamLibrary/Dumper-7/Discovery/Dumper-7.ini";
+	/* Keep the tracked default portable. Wine/Proton users can point this at a
+	 * host path through Dumper-7.ini without carrying that path in the fork. */
+	inline constexpr const char* DefaultOutputPath = "C:/Dumper-7/Discovery";
+	inline constexpr const char* GlobalConfigPath = "C:/Dumper-7/Discovery/Dumper-7.ini";
 
 	namespace Config
 	{

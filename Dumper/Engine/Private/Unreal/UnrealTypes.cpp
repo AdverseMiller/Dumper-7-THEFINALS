@@ -1,6 +1,8 @@
 
 #include <algorithm>
+#include <array>
 #include <format>
+#include <set>
 #include <stdexcept>
 
 #include "Unreal/UnrealTypes.h"
@@ -12,11 +14,205 @@
 
 namespace
 {
+	struct DiscoveryRegisterAliases
+	{
+		std::array<bool, 16> FName{};
+		std::array<bool, 16> Builder{};
+	};
+
+	bool DecodeRegisterMove(const uint8_t* Instruction, const uint8_t* End, uint8_t& Destination, uint8_t& Source, std::size_t& Length)
+	{
+		if (End - Instruction < 3 || (Instruction[0] & 0xF8) != 0x48 || Instruction[1] != 0x89 || (Instruction[2] & 0xC0) != 0xC0)
+			return false;
+
+		const uint8_t Rex = Instruction[0];
+		const uint8_t ModRm = Instruction[2];
+		Source = static_cast<uint8_t>(((ModRm >> 3) & 0x7) | ((Rex & 0x4) ? 0x8 : 0x0));
+		Destination = static_cast<uint8_t>((ModRm & 0x7) | ((Rex & 0x1) ? 0x8 : 0x0));
+		Length = 3;
+		return true;
+	}
+
+	void RecoverDiscoveryArgumentAliases(const uint8_t* Begin, const uint8_t* End, DiscoveryRegisterAliases& Aliases)
+	{
+		Aliases.FName[1] = true;
+		Aliases.Builder[2] = true;
+
+		const uint8_t* Cursor = Begin;
+		const uint8_t* AliasEnd = std::min(End, Begin + 0x60);
+		while (Cursor < AliasEnd)
+		{
+			uint8_t Destination = 0;
+			uint8_t Source = 0;
+			std::size_t Length = 0;
+			if (DecodeRegisterMove(Cursor, AliasEnd, Destination, Source, Length))
+			{
+				if (Aliases.FName[Source])
+					Aliases.FName[Destination] = true;
+				if (Aliases.Builder[Source])
+					Aliases.Builder[Destination] = true;
+				Cursor += Length;
+				continue;
+			}
+
+			Cursor++;
+		}
+	}
+
+	bool HasDiscoveryBuilderReset(const uint8_t* Begin, const uint8_t* End, const DiscoveryRegisterAliases& Aliases)
+	{
+		const uint8_t* SearchEnd = std::min(End, Begin + 0x80);
+		for (const uint8_t* Cursor = Begin; Cursor + 7 <= SearchEnd; Cursor++)
+		{
+			const uint8_t LoadRex = Cursor[0];
+			const uint8_t LoadModRm = Cursor[2];
+			const uint8_t StoreRex = Cursor[3];
+			const uint8_t StoreModRm = Cursor[5];
+			if ((LoadRex & 0xF8) != 0x48 || Cursor[1] != 0x8B || (LoadModRm & 0xC0) != 0x00)
+				continue;
+			if ((StoreRex & 0xF8) != 0x48 || Cursor[4] != 0x89 || (StoreModRm & 0xC0) != 0x40 || Cursor[6] != 0x08)
+				continue;
+
+			const uint8_t LoadBase = static_cast<uint8_t>((LoadModRm & 0x7) | ((LoadRex & 0x1) ? 0x8 : 0x0));
+			const uint8_t LoadDestination = static_cast<uint8_t>(((LoadModRm >> 3) & 0x7) | ((LoadRex & 0x4) ? 0x8 : 0x0));
+			const uint8_t StoreBase = static_cast<uint8_t>((StoreModRm & 0x7) | ((StoreRex & 0x1) ? 0x8 : 0x0));
+			const uint8_t StoreSource = static_cast<uint8_t>(((StoreModRm >> 3) & 0x7) | ((StoreRex & 0x4) ? 0x8 : 0x0));
+			if (LoadBase == StoreBase && LoadDestination == StoreSource && Aliases.Builder[LoadBase])
+				return true;
+		}
+
+		return false;
+	}
+
+	bool DecodeNumberRead(const uint8_t* Instruction, const uint8_t* End, const DiscoveryRegisterAliases& Aliases, uint8_t& Destination, std::size_t& Length)
+	{
+		if (Instruction >= End)
+			return false;
+
+		const uint8_t* Cursor = Instruction;
+		uint8_t Rex = 0;
+		if ((*Cursor & 0xF0) == 0x40)
+		{
+			Rex = *Cursor++;
+			if (Cursor >= End)
+				return false;
+		}
+
+		if (End - Cursor < 3 || Cursor[0] != 0x8B || (Cursor[1] & 0xC0) != 0x40 || Cursor[2] != 0x04)
+			return false;
+
+		const uint8_t ModRm = Cursor[1];
+		const uint8_t Base = static_cast<uint8_t>((ModRm & 0x7) | ((Rex & 0x1) ? 0x8 : 0x0));
+		if (!Aliases.FName[Base])
+			return false;
+
+		Destination = static_cast<uint8_t>(((ModRm >> 3) & 0x7) | ((Rex & 0x4) ? 0x8 : 0x0));
+		Length = static_cast<std::size_t>((Cursor - Instruction) + 3);
+		return true;
+	}
+
+	bool IsTestOfRegister(const uint8_t* Instruction, const uint8_t* End, const uint8_t Register)
+	{
+		if (End - Instruction < 2 || Instruction[0] != 0x85 || (Instruction[1] & 0xC0) != 0xC0)
+			return false;
+
+		const uint8_t ModRm = Instruction[1];
+		return ((ModRm >> 3) & 0x7) == (Register & 0x7) && (ModRm & 0x7) == (Register & 0x7);
+	}
+
+	bool HasDecrementOfRegister(const uint8_t* Begin, const uint8_t* End, const uint8_t Register)
+	{
+		for (const uint8_t* Cursor = Begin; Cursor < End; Cursor++)
+		{
+			const uint8_t* Opcode = Cursor;
+			uint8_t Rex = 0;
+			if ((*Opcode & 0xF0) == 0x40)
+			{
+				Rex = *Opcode++;
+				if (Opcode >= End)
+					break;
+			}
+
+			if (End - Opcode >= 2 && Opcode[0] == 0xFF && (Opcode[1] & 0xF8) == 0xC8)
+			{
+				const uint8_t Operand = static_cast<uint8_t>((Opcode[1] & 0x7) | ((Rex & 0x1) ? 0x8 : 0x0));
+				if (Operand == Register)
+					return true;
+			}
+
+			if (End - Opcode >= 3 && Opcode[0] == 0x83 && (Opcode[1] & 0xF8) == 0xE8 && Opcode[2] == 0x01)
+			{
+				const uint8_t Operand = static_cast<uint8_t>((Opcode[1] & 0x7) | ((Rex & 0x1) ? 0x8 : 0x0));
+				if (Operand == Register)
+					return true;
+			}
+		}
+
+		return false;
+	}
+
+	bool IsDiscoveryAppendStringFunction(const uint8_t* Begin, const uint8_t* End)
+	{
+		if (End <= Begin || End - Begin < 0x80 || End - Begin > 0x400)
+			return false;
+
+		DiscoveryRegisterAliases Aliases;
+		RecoverDiscoveryArgumentAliases(Begin, End, Aliases);
+		if (!HasDiscoveryBuilderReset(Begin, End, Aliases))
+			return false;
+
+		const uint8_t* Underscore = nullptr;
+		for (const uint8_t* Cursor = Begin; Cursor + 5 <= End; Cursor++)
+		{
+			if (Cursor[0] == 0x66 && Cursor[1] == 0xC7 && ((Cursor[2] >> 3) & 0x7) == 0 && Cursor[3] == 0x5F && Cursor[4] == 0x00)
+			{
+				Underscore = Cursor;
+				break;
+			}
+		}
+		if (!Underscore)
+			return false;
+
+		for (const uint8_t* Cursor = Begin; Cursor < Underscore; Cursor++)
+		{
+			uint8_t NumberRegister = 0;
+			std::size_t ReadLength = 0;
+			if (!DecodeNumberRead(Cursor, Underscore, Aliases, NumberRegister, ReadLength))
+				continue;
+
+			const uint8_t* Test = Cursor + ReadLength;
+			if (!IsTestOfRegister(Test, Underscore, NumberRegister))
+				continue;
+
+			if (HasDecrementOfRegister(Underscore + 5, std::min(End, Underscore + 0x40), NumberRegister))
+				return true;
+		}
+
+		return false;
+	}
+
+	const RUNTIME_FUNCTION* FindRuntimeFunction(const RUNTIME_FUNCTION* Functions, const std::size_t Count, const DWORD Rva)
+	{
+		std::size_t Left = 0;
+		std::size_t Right = Count;
+		while (Left < Right)
+		{
+			const std::size_t Middle = Left + ((Right - Left) / 2);
+			if (Functions[Middle].BeginAddress <= Rva)
+				Left = Middle + 1;
+			else
+				Right = Middle;
+		}
+
+		if (Left == 0)
+			return nullptr;
+
+		const RUNTIME_FUNCTION* Function = &Functions[Left - 1];
+		return Rva < Function->EndAddress ? Function : nullptr;
+	}
+
 	void* FindDiscoveryAppendString(const char* const ModuleName)
 	{
-		constexpr const char* Signature = "41 56 41 55 56 57 53 48 83 EC ?? 48 89 D7 49 89 CE 48 8B 05 ?? ?? ?? ?? 48 31 E0 48 89 44 24 ?? 48 8B 02 48 89 42 08";
-		constexpr std::uintptr_t SignatureSize = 0x27;
-
 		const std::uintptr_t ModuleBase = Platform::GetModuleBase(ModuleName);
 		if (!ModuleBase)
 			throw std::runtime_error("Discovery FName::AppendString scan could not locate the main module");
@@ -29,9 +225,14 @@ namespace
 		if (Platform::IsBadReadPtr(NtHeaders) || NtHeaders->Signature != IMAGE_NT_SIGNATURE)
 			throw std::runtime_error("Discovery FName::AppendString scan found an invalid NT header");
 
+		const IMAGE_DATA_DIRECTORY& ExceptionDirectory = NtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+		if (!ExceptionDirectory.VirtualAddress || ExceptionDirectory.Size < sizeof(RUNTIME_FUNCTION))
+			throw std::runtime_error("Discovery FName::AppendString scan found no exception directory");
+
+		const auto* RuntimeFunctions = reinterpret_cast<const RUNTIME_FUNCTION*>(ModuleBase + ExceptionDirectory.VirtualAddress);
+		const std::size_t RuntimeFunctionCount = ExceptionDirectory.Size / sizeof(RUNTIME_FUNCTION);
 		const std::uintptr_t ModuleEnd = ModuleBase + NtHeaders->OptionalHeader.SizeOfImage;
-		void* Match = nullptr;
-		bool bAmbiguous = false;
+		std::set<DWORD> Matches;
 
 		Platform::IterateMemoryRegionsWithCallback([&](void* Base, const size_t Size) -> bool
 		{
@@ -39,35 +240,35 @@ namespace
 			const std::uintptr_t RegionEnd = RegionStart + Size;
 			const std::uintptr_t SearchStart = std::max(RegionStart, ModuleBase);
 			const std::uintptr_t SearchEnd = std::min(RegionEnd, ModuleEnd);
-			if (SearchEnd <= SearchStart || SearchEnd - SearchStart <= SignatureSize)
+			if (SearchEnd <= SearchStart || SearchEnd - SearchStart < 5)
 				return false;
 
-			std::uintptr_t Cursor = SearchStart;
-			while (Cursor + SignatureSize < SearchEnd)
+			for (std::uintptr_t Cursor = SearchStart; Cursor + 5 <= SearchEnd; Cursor++)
 			{
-				void* Candidate = Platform::FindPatternInRange(Signature, Cursor, SearchEnd - Cursor);
-				if (!Candidate)
-					break;
+				const auto* Bytes = reinterpret_cast<const uint8_t*>(Cursor);
+				if (Bytes[0] != 0x66 || Bytes[1] != 0xC7 || ((Bytes[2] >> 3) & 0x7) != 0 || Bytes[3] != 0x5F || Bytes[4] != 0x00)
+					continue;
 
-				if (Match && Match != Candidate)
-				{
-					bAmbiguous = true;
-					return true;
-				}
+				const DWORD CandidateRva = static_cast<DWORD>(Cursor - ModuleBase);
+				const RUNTIME_FUNCTION* RuntimeFunction = FindRuntimeFunction(RuntimeFunctions, RuntimeFunctionCount, CandidateRva);
+				if (!RuntimeFunction || Matches.contains(RuntimeFunction->BeginAddress))
+					continue;
 
-				Match = Candidate;
-				Cursor = reinterpret_cast<std::uintptr_t>(Candidate) + 1;
+				const auto* FunctionBegin = reinterpret_cast<const uint8_t*>(ModuleBase + RuntimeFunction->BeginAddress);
+				const auto* FunctionEnd = reinterpret_cast<const uint8_t*>(ModuleBase + RuntimeFunction->EndAddress);
+				if (!Platform::IsBadReadPtr(FunctionBegin) && !Platform::IsBadReadPtr(FunctionEnd - 1) && IsDiscoveryAppendStringFunction(FunctionBegin, FunctionEnd))
+					Matches.insert(RuntimeFunction->BeginAddress);
 			}
 
 			return false;
 		}, false);
 
-		if (bAmbiguous)
-			throw std::runtime_error("Discovery FName::AppendString signature matched multiple locations");
-		if (!Match)
-			throw std::runtime_error("Discovery FName::AppendString signature was not found in readable main-module memory");
+		if (Matches.size() > 1)
+			throw std::runtime_error("Discovery FName::AppendString semantic scan matched multiple functions");
+		if (Matches.empty())
+			throw std::runtime_error("Discovery FName::AppendString semantic scan found no decoded implementation");
 
-		return Match;
+		return reinterpret_cast<void*>(ModuleBase + *Matches.begin());
 	}
 }
 
