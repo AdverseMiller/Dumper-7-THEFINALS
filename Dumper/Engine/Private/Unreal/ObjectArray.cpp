@@ -612,7 +612,21 @@ void ObjectArray::InitDiscovery(const char* const ModuleName)
 	Discovery::ChunkCount = 0;
 
 	DiscoveredObjectArray DiscoveredArray;
-	if (DiscoverFirstObjectChunk(ModuleName, DiscoveredArray))
+	bool FoundObjectChunk = false;
+	constexpr int32_t BootstrapAttempts = 120;
+	for (int32_t Attempt = 0; Attempt < BootstrapAttempts && !FoundObjectChunk; ++Attempt)
+	{
+		DiscoveredArray = {};
+		FoundObjectChunk = DiscoverFirstObjectChunk(ModuleName, DiscoveredArray);
+		if (!FoundObjectChunk && Attempt + 1 < BootstrapAttempts)
+		{
+			if (Attempt == 0 || (Attempt + 1) % 20 == 0)
+				std::cerr << std::format("Discovery bootstrap: reflection is not initialized yet; retry {}/{}\n", Attempt + 2, BootstrapAttempts);
+			::Sleep(250);
+		}
+	}
+
+	if (FoundObjectChunk)
 	{
 		std::cerr << std::format("Discovery bootstrap: first chunk found; item size 0x{:X}, index +0x{:X}\n", DiscoveredArray.ItemSize, DiscoveredArray.InternalIndexOffset);
 		const std::uintptr_t ModuleBase = Platform::GetModuleBase(ModuleName);

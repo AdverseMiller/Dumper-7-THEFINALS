@@ -92,18 +92,19 @@ DWORD MainThread(HMODULE Module)
 	AllocConsole();
 	FILE* Dummy = nullptr;
 	freopen_s(&Dummy, "CONIN$", "r", stdin);
-	std::filesystem::create_directories(Settings::DefaultOutputPath);
-	const auto LogPath = std::filesystem::path(Settings::DefaultOutputPath) / "Dumper-7.log";
-	freopen_s(&Dummy, LogPath.string().c_str(), "w", stderr);
-	std::cerr.clear(); // clear internal error flags on cerr after redirect
-	std::cerr << std::boolalpha << std::hex;
-
-	std::cerr << "Initializing [Dumper-7]\n";
 
 	try
 	{
 
 	Settings::Config::Load();
+	std::filesystem::create_directories(Settings::Generator::SDKGenerationPath);
+	const auto LogPath = std::filesystem::path(Settings::Generator::SDKGenerationPath) / "Dumper-7.log";
+	freopen_s(&Dummy, LogPath.string().c_str(), "w", stderr);
+	std::cerr.clear(); // clear internal error flags on cerr after redirect
+	std::cerr << std::boolalpha << std::hex;
+
+	std::cerr << "Initializing [Dumper-7]\n";
+	std::cerr << "SDK Generation Path: " << Settings::Generator::SDKGenerationPath << "\n";
 	Settings::Config::DelayDumperStart();
 
 	std::cerr << "Started Generation [Dumper-7]!\n";

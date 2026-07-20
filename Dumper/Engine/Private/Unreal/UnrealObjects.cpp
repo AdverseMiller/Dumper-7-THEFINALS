@@ -826,7 +826,8 @@ bool UEStruct::HasMembers() const
 
 EClassCastFlags UEClass::GetCastFlags() const
 {
-	return *reinterpret_cast<EClassCastFlags*>(Object + Off::UClass::CastFlags);
+	const uint64 Raw = *reinterpret_cast<const uint64*>(Object + Off::UClass::CastFlags);
+	return static_cast<EClassCastFlags>(Discovery::Enabled ? Raw ^ Discovery::ClassCastFlagsXorKey : Raw);
 }
 
 std::string UEClass::StringifyCastFlags() const

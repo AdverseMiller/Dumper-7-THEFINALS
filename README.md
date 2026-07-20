@@ -1,118 +1,98 @@
+# Dumper-7 for THE FINALS
 
-# Dumper-7
+A Dumper-7 fork designated for dumping THE FINALS.
 
-SDK Generator for all Unreal Engine games. Supported versions are all of UE4 and UE5.
+The main goal of this fork is to take as much manual work as possible out of updating the dumper. Instead of relying on a list of RVAs and cipher constants, it finds and validates the necessary UE structures at runtime through various heuristics.
 
-## How to use
+## Features
 
-- Compile the dll in x64-Release
-- Inject the dll into your target game
-- The SDK is generated into the path specified by `Settings::SDKGenerationPath`. This Discovery fork defaults to `Z:\\mnt\\SteamLibrary\\Dumper-7\\Discovery` under Wine (`/mnt/SteamLibrary/Dumper-7/Discovery` on the Linux host).
-- **See [UsingTheSDK](UsingTheSDK.md) for a guide to get started, or to migrate from an old SDK.**
-## Support Me
+- Cipher-free object-array reconstruction.
+- Dynamic protected UObject and FField decoder extraction.
+- Semantic AppendString and ProcessEvent discovery.
+- Automated reflection-layout recovery.
+- Automatic ChildProperties, FField, FFieldClass, and FProperty resolution.
+- Protector-aware generated SDK helpers.
+- No fixed GObjects, AppendString, or ProcessEvent RVA.
+- No debugger attachment, breakpoints, or thread suspension.
+- Fail-closed validation instead of silently generating a broken SDK.
+- C++ SDK, mappings, IDA mappings, and Dumpspace generation.
+- A detailed `discovery-report.json` for everything recovered during the dump.
 
-KoFi: https://ko-fi.com/fischsalat \
-Patreon: https://www.patreon.com/u119629245
+Given that the game is heavily repacked with each update, there is no guarantee that every new build will work untouched. The aim is to keep any update work small and localized instead of having to reverse and rewrite the dumper again from scratch.
 
-LTC (LTC-network): `LLtXWxDbc5H9d96VJF36ZpwVX6DkYGpTJU` \
-BTC (Bitcoin): `1DVDUMcotWzEG1tyd1FffyrYeu4YEh7spx` \
-USDT (Tron (TRC20)): `TWHDoUr2H52Gb2WYdZe7z1Ct316gMg64ps`
+## Tested builds
 
-## Overriding Offsets
+This fork has been tested successfully against numerous game builds with very different code and reflection layouts, including:
 
-- ### Only override any offsets if the generator doesn't find them, or if they are incorrect
-- All overrides are made in **Generator::InitEngineCore()** inside of **Generator.cpp**
+- 10.12 (`23895020`)
+- 10.14 (`23999122`)
+- 11.0 (`24101480`)
+- 11.1 (`24195074`)
 
-- GObjects (see [GObjects-Layout](#overriding-gobjects-layout) too)
-  ```cpp
-  ObjectArray::Init(/*GObjectsOffset*/, /*ChunkSize*/, /*bIsChunked*/);
-  ```
-  ```cpp
-  /* Make sure only to use types which exist in the sdk (eg. uint8, uint64) */
-  InitObjectArrayDecryption([](void* ObjPtr) -> uint8* { return reinterpret_cast<uint8*>(uint64(ObjPtr) ^ 0x8375); });
-  ```
-- FName::AppendString
-  - Forcing GNames:
-    ```cpp
-    FName::Init(/*bForceGNames*/); // Useful if the AppendString offset is wrong
-    ```
-  - Overriding the offset:
-    ```cpp
-    FName::Init(/*OverrideOffset, OverrideType=[AppendString, ToString, GNames], bIsNamePool*/);
-    ```
-- ProcessEvent
-  ```cpp
-  Off::InSDK::InitPE(/*PEIndex*/);
-  ```
-## Overriding GObjects-Layout
-- Only add a new layout if GObjects isn't automatically found for your game.
-- Layout overrides are at roughly line 30 of `ObjectArray.cpp`
-- For UE4.11 to UE4.20 add the layout to `FFixedUObjectArrayLayouts`
-- For UE4.21 and higher add the layout to `FChunkedFixedUObjectArrayLayouts`
-- **Examples:**
-  ```cpp
-  FFixedUObjectArrayLayout // Default UE4.11 - UE4.20
-  {
-      .ObjectsOffset = 0x0,
-      .MaxObjectsOffset = 0x8,
-      .NumObjectsOffset = 0xC
-  }
-  ```
-  ```cpp
-  FChunkedFixedUObjectArrayLayout // Default UE4.21 and above
-  {
-      .ObjectsOffset = 0x00,
-      .MaxElementsOffset = 0x10,
-      .NumElementsOffset = 0x14,
-      .MaxChunksOffset = 0x18,
-      .NumChunksOffset = 0x1C,
-  }
-  ```
+Each completed the full SDK, mappings, IDA mappings, and Dumpspace pipeline. The generated CoreUObject SDK also passed its C++ layout assertions, and the game remained running after each final test.
 
-## Config File
-You can optionally dynamically change settings through a `Dumper-7.ini` file, instead of modifying `Settings.h`.
-- **Per-game**: Create `Dumper-7.ini` in the same directory as the game's exe file.
-- **Global**: Create `Dumper-7.ini` under `Z:\mnt\SteamLibrary\Dumper-7\Discovery`.
-- Profiles do not merge. In other words your global profile does not change the default settings.
-  
-- **SleepTimeout:**
-  - If non-zero dump will start after a delay
-  - Values under 1000 assumed to be in seconds, otherwise in milliseconds
-  - If both SleepTimeout and DumpKey are set whichever occurs first will trigger the dump
-- **DumpKey:** 
-  - If non-zero dump will start upon key press
-  - Value should be a hex or decimal integer corresponding to a [virtual keycode](https://learn.microsoft.com/en-us/windows/win32/inputdev/virtual-key-codes).
-  - Hex integers should start with 0x.
-- **SDKNamespaceName:**
-  - Changes the namespace in the generated files.
-- **SDKGenerationPath:**
-  - Generate output at the specified path instead of `Z:/mnt/SteamLibrary/Dumper-7/Discovery`.
-  - Paths are relative to game executable unless you use an absolute path including drive letter.
-  - Use `..` to access parent directories. Do not include quotes.
+For the full recovery chain and test results, see [Discovery automation](docs/discovery-automation.md).
 
+## Building
 
-### Example:
+Build the project as an x64 Release DLL. With Visual Studio 2022 and CMake:
+
+```powershell
+cmake --preset vs2022
+cmake --build --preset vs2022-Release
+```
+
+The included Visual Studio solution can also be used directly.
+
+## Using it
+
+1. Start THE FINALS and let it finish normal initialization.
+2. Load the Release DLL into `Discovery.exe` or `Discovery-d.exe`, depending on the build.
+3. Wait for `Generating SDK took (...)` in the Dumper-7 log.
+4. Check the generated SDK and `discovery-report.json` before using them.
+
+Loading too early can leave protected code pages unavailable to the scanners. If discovery stops safely near startup, wait until the game is initialized and try again rather than adding a fallback RVA.
+
+Building the DLL does not load it into the game. Loading is always a separate action.
+
+## Output
+
+The default output directory is:
+
+```text
+C:\Dumper-7\Discovery
+```
+
+Each dump is placed in its own game folder beneath that directory. Wine/Proton users can use `Dumper-7.ini` to redirect output to any host path exposed through the `Z:` drive.
+
+## Configuration
+
+Settings can be changed with `Dumper-7.ini`:
+
 ```ini
 [Settings]
 SleepTimeout=30
-SDKNamespaceName=MyOwnSDKNamespace
+SDKNamespaceName=SDK
 DumpKey=0x77
-SDKGenerationPath=./
+SDKGenerationPath=C:/Dumper-7/Discovery
 ```
-- These settings would generate the SDK in the same folder as the game and would start after 30 seconds or upon pressing F8.
 
-## Issues
+- `SleepTimeout` delays the dump.
+- `DumpKey` starts it with a Windows virtual key.
+- `SDKNamespaceName` changes the generated namespace.
+- `SDKGenerationPath` changes the output directory.
 
-If you have any issues using the Dumper, please create an Issue on this repository\
-and explain the problem **in detail**.
+For example, a Wine/Proton installation can keep dumps outside its prefix with:
 
-- Should your game be crashing while dumping, attach Visual Studios' debugger to the game and inject the Dumper-7.dll in debug-configuration.
-Then include screenshots of the exception causing the crash, a screenshot of the callstack, as well as the console output.
+```ini
+[Settings]
+SDKGenerationPath=Z:/path/on/the/host/Dumper-7/Discovery
+```
 
-- For compiler-errors in the SDK (first verify you followed all of the steps from [UsingTheSDK](UsingTheSDK.md) correctly):
-  1. Send screenshots of the errors in the error-window, make sure to select **`Build Only`**, not `Build + Intellisense`, as Intellisense often reports false positives.
-  2. Also send a screenshot of the first error in the **Output**-window (NOT the error-window) and one of the code location causing that exact error.
-  3. If you're able to fix the error (eg. missing padding in predefined struct, or incorrect use of macro name) please still report it in an issue with the fix included.
-  4. If you're not able to resolve the issue yourself please upload the entire generated folder (not just CppSDK) somewhere and attach the link to your issue.
+## Using the generated SDK
 
-- Should your own dll-project crash, verify your code thoroughly to make sure the error actually lies within the generated SDK.
+See [UsingTheSDK](UsingTheSDK.md) for SDK integration and migration notes.
+
+## Credits
+
+This project is based on [Encryqed/Dumper-7](https://github.com/Encryqed/Dumper-7). The general SDK generator comes from upstream; the THE FINALS automation, protected-runtime recovery, validation, reporting, and generated SDK fixes are maintained in this fork.

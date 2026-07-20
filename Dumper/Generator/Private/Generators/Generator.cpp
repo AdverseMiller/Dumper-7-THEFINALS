@@ -171,33 +171,63 @@ void Generator::WriteDiscoveryReport()
 
 	Report["uobject"]["flags_offset"] = Hex(Off::UObject::Flags);
 	Report["uobject"]["index_offset"] = Hex(Off::UObject::Index);
+	Report["uclass"]["cast_flags_offset"] = Hex(Off::UClass::CastFlags);
+	Report["uclass"]["cast_flags_xor"] = Hex(Discovery::ClassCastFlagsXorKey);
 	Report["uobject"]["protected_address_offset"] = Hex(Discovery::ProtectedAddressOffset);
 	Report["uobject"]["protected_data_offset"] = Hex(Discovery::ProtectedSlotDataOffset);
 	Report["uobject"]["protected_slot_stride"] = Hex(Discovery::ProtectedSlotStride);
-	Report["uobject"]["protected_slot_rotate_left"] = Discovery::ProtectedSlotRotate;
-	Report["uobject"]["protected_mask_hex"] = BytesToHex(Discovery::ProtectedSlotMask);
-	Report["uobject"]["protected_shuffle_hex"] = BytesToHex(Discovery::ProtectedSlotShuffle);
+	Report["uobject"]["protected_vector_program"]["input_register"] = Discovery::ProtectedSlotInputRegister;
+	Report["uobject"]["protected_vector_program"]["instruction_count"] = Discovery::ProtectedSlotProgramSize;
+	for (std::uint32_t Index = 0; Index < Discovery::ProtectedSlotProgramSize; ++Index)
+	{
+		const Discovery::ProtectedVectorInstruction& Instruction = Discovery::ProtectedSlotProgram[Index];
+		nlohmann::json Entry;
+		Entry["opcode"] = static_cast<std::uint8_t>(Instruction.Opcode);
+		Entry["destination"] = Instruction.Destination;
+		Entry["source"] = Instruction.Source;
+		Entry["immediate"] = Instruction.Immediate;
+		Entry["source_is_constant"] = Instruction.SourceIsConstant;
+		if (Instruction.SourceIsConstant)
+			Entry["constant_hex"] = BytesToHex(Instruction.Constant);
+		Report["uobject"]["protected_vector_program"]["instructions"].push_back(std::move(Entry));
+	}
 	Report["uobject"]["class_slots"] = Discovery::ProtectedClassSlots;
 	Report["uobject"]["outer_slots"] = Discovery::ProtectedOuterSlots;
 	Report["uobject"]["name_slots"] = Discovery::ProtectedNameSlots;
-	Report["uobject"]["hash"]["high_shift"] = Discovery::ProtectedHashHighShift;
-	Report["uobject"]["hash"]["rotate_1"] = Discovery::ProtectedHashRotate1;
-	Report["uobject"]["hash"]["rotate_2"] = Discovery::ProtectedHashRotate2;
-	Report["uobject"]["hash"]["rotate_3"] = Discovery::ProtectedHashRotate3;
-	Report["uobject"]["hash"]["final_shift"] = Discovery::ProtectedHashFinalShift;
-	Report["uobject"]["hash"]["fold_shift"] = Discovery::ProtectedHashFoldShift;
-	Report["uobject"]["hash"]["multiplier"] = Hex(Discovery::ProtectedHashMultiplier);
-	Report["uobject"]["hash"]["addend"] = Hex(Discovery::ProtectedHashAddend);
-	Report["uobject"]["hash"]["slot_mask"] = Hex(Discovery::ProtectedHashSlotMask);
+	Report["uobject"]["protected_hash_program"]["instruction_count"] = Discovery::ProtectedHashProgramSize;
+	for (std::uint32_t Index = 0; Index < Discovery::ProtectedHashProgramSize; ++Index)
+	{
+		const Discovery::ProtectedScalarInstruction& Instruction = Discovery::ProtectedHashProgram[Index];
+		nlohmann::json Entry;
+		Entry["opcode"] = static_cast<std::uint8_t>(Instruction.Opcode);
+		Entry["destination"] = Instruction.Destination;
+		Entry["source"] = Instruction.Source;
+		Entry["is_64_bit"] = Instruction.Is64Bit;
+		Entry["immediate"] = Hex(Instruction.Immediate);
+		Report["uobject"]["protected_hash_program"]["instructions"].push_back(std::move(Entry));
+	}
 
 	Report["ffield"]["name_offset"] = Hex(Off::FField::Name);
 	Report["ffield"]["next_offset"] = Hex(Off::FField::Next);
 	Report["ffield"]["class_offset"] = Hex(Off::FField::Class);
 	Report["ffield"]["owner_offset"] = Hex(Off::FField::Owner);
-	Report["ffield"]["name_word_rotate_left"] = Discovery::FieldNameWordRotate;
-	Report["ffield"]["name_result_rotate_left"] = Discovery::FieldNameResultRotate;
-	Report["ffield"]["name_xor"] = Hex(Discovery::FieldNameXorKey);
-	Report["ffield"]["name_shuffle_hex"] = BytesToHex(Discovery::FieldNameShuffle);
+	Report["ffield"]["name_vector_program"]["input_register"] = Discovery::FieldNameInputRegister;
+	Report["ffield"]["name_vector_program"]["instruction_count"] = Discovery::FieldNameProgramSize;
+	for (std::uint32_t Index = 0; Index < Discovery::FieldNameProgramSize; ++Index)
+	{
+		const Discovery::ProtectedVectorInstruction& Instruction = Discovery::FieldNameProgram[Index];
+		nlohmann::json Entry;
+		Entry["opcode"] = static_cast<std::uint8_t>(Instruction.Opcode);
+		Entry["destination"] = Instruction.Destination;
+		Entry["source"] = Instruction.Source;
+		Entry["immediate"] = Instruction.Immediate;
+		Entry["source_is_constant"] = Instruction.SourceIsConstant;
+		if (Instruction.SourceIsConstant)
+			Entry["constant_hex"] = BytesToHex(Instruction.Constant);
+		Report["ffield"]["name_vector_program"]["instructions"].push_back(std::move(Entry));
+	}
+	Report["ffield"]["name_scalar_xor"] = Hex(Discovery::FieldNameScalarXor);
+	Report["ffield"]["name_scalar_rotate_left"] = Discovery::FieldNameScalarRotate;
 	Report["ffield_class"]["super_offset"] = Hex(Off::FFieldClass::SuperClass);
 	Report["ffield_class"]["cast_flags_offset"] = Hex(Off::FFieldClass::CastFlags);
 	Report["ffield_class"]["id_offset"] = Hex(Off::FFieldClass::Id);
