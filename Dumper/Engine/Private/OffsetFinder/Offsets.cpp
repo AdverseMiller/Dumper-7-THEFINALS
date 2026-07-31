@@ -421,71 +421,7 @@ namespace
 		return true;
 	}
 
-	bool ParseDiscoveryCarrylessHelper(const std::uint8_t* Cursor, const std::uint8_t* End, const std::uintptr_t ModuleBase, const std::uintptr_t ModuleEnd, const std::uint8_t InputRegister, std::vector<Discovery::ProtectedVectorInstruction>& Instructions)
-	{
-		const std::uint8_t* SearchEnd = std::min(End, Cursor + 0x80);
-		std::uint64_t FirstKey = 0;
-		std::uint64_t SecondKey = 0;
-		bool HasFirstKey = false;
-		bool HasSecondKey = false;
-		for (const std::uint8_t* Instruction = Cursor; Instruction + 10 <= SearchEnd; ++Instruction)
-		{
-			if (Instruction[0] == 0x48 && Instruction[1] == 0xBA)
-			{
-				std::memcpy(&FirstKey, Instruction + 2, sizeof(FirstKey));
-				HasFirstKey = true;
-				continue;
-			}
-			if (Instruction[0] == 0x49 && Instruction[1] == 0xB8)
-			{
-				std::memcpy(&SecondKey, Instruction + 2, sizeof(SecondKey));
-				HasSecondKey = true;
-				continue;
-			}
-			if (Instruction[0] != 0xE8 || !HasFirstKey || !HasSecondKey)
-				continue;
-
-			std::int32_t Relative = 0;
-			std::memcpy(&Relative, Instruction + 1, sizeof(Relative));
-			const std::uint8_t* Helper = ResolveDirectJump(Instruction + 5 + Relative, ModuleBase, ModuleEnd);
-			const std::uintptr_t HelperAddress = reinterpret_cast<std::uintptr_t>(Helper);
-			if (!Helper || HelperAddress < ModuleBase || HelperAddress >= ModuleEnd)
-				continue;
-
-			const std::size_t HelperSpan = GetReadableSpan(Helper, 0x40);
-			if (HelperSpan < 0x20 || std::memcmp(Helper, "\x66\x0F\x6F\x01", 4) != 0)
-				continue;
-
-			int CarrylessMultiplyCount = 0;
-			bool HasReturn = false;
-			for (std::size_t Offset = 0; Offset < HelperSpan; ++Offset)
-			{
-				if (Offset + 3 <= HelperSpan && Helper[Offset] == 0x0F && Helper[Offset + 1] == 0x3A && Helper[Offset + 2] == 0x44)
-					++CarrylessMultiplyCount;
-				if (Helper[Offset] == 0xC3)
-					HasReturn = true;
-			}
-			if (CarrylessMultiplyCount != 2 || !HasReturn)
-				continue;
-
-			Discovery::ProtectedVectorInstruction Decode{};
-			Decode.Opcode = Discovery::ProtectedVectorOpcode::CarrylessDecode;
-			Decode.Destination = InputRegister;
-			Decode.Source = InputRegister;
-			std::memcpy(Decode.Constant.data(), &FirstKey, sizeof(FirstKey));
-			std::memcpy(Decode.Constant.data() + sizeof(FirstKey), &SecondKey, sizeof(SecondKey));
-			Instructions.push_back(Decode);
-			Instructions.push_back({
-				.Opcode = Discovery::ProtectedVectorOpcode::ReturnLowQword,
-				.Source = InputRegister,
-			});
-			return true;
-		}
-
-		return false;
-	}
-
-	bool ParseDiscoveryVectorProgram(const std::uint8_t* Dispatcher, const std::size_t Span, const std::size_t LoadOffset, const std::uintptr_t ModuleBase, const std::uintptr_t ModuleEnd, DiscoveryVectorProgram& Result)
+	bool ParseDiscoveryVectorProgram(const std::uint8_t* Dispatcher, const std::size_t Span, const std::size_t LoadOffset, const std::uintptr_t ModuleBase, const std::uintptr_t ModuleEnd, const bool UseStoredLowLane, DiscoveryVectorProgram& Result)
 	{
 		const std::uint8_t* End = Dispatcher + Span;
 		const std::uint8_t* Cursor = Dispatcher + LoadOffset;
@@ -500,6 +436,8 @@ namespace
 			return false;
 		const bool LoadAndShuffleLowWords = LoadPrefix == 0xF2 && Cursor[1] == 0x70;
 		if (!LoadAndShuffleLowWords && !(LoadPrefix == 0x66 && Cursor[1] == 0x6F))
+			return false;
+		if (UseStoredLowLane && LoadAndShuffleLowWords)
 			return false;
 
 		const std::uint8_t LoadModRm = Cursor[2];
@@ -589,10 +527,17 @@ namespace
 			});
 		}
 
-		Cursor = Dispatcher + LoadOffset + LoadLength;
-		if (ParseDiscoveryCarrylessHelper(Cursor, End, ModuleBase, ModuleEnd, InputRegister, Result.Instructions))
+		if (UseStoredLowLane)
+		{
+			Result.InputRegister = 0;
+			Result.Instructions.push_back({
+				.Opcode = Discovery::ProtectedVectorOpcode::ReturnLowQword,
+				.Source = 0,
+			});
 			return true;
+		}
 
+		Cursor = Dispatcher + LoadOffset + LoadLength;
 		while (Cursor < End && Result.Instructions.size() < Discovery::ProtectedSlotProgram.size())
 		{
 			if (*Cursor != 0x66)
@@ -698,42 +643,27 @@ namespace
 		return false;
 	}
 
-	bool FindDiscoveryVectorProgram(const std::uint8_t* Dispatcher, const std::size_t Span, const std::uintptr_t ModuleBase, const std::uintptr_t ModuleEnd, DiscoveryVectorProgram& Result)
+	std::vector<DiscoveryVectorProgram> FindDiscoveryVectorPrograms(const std::uint8_t* Dispatcher, const std::size_t Span, const std::uintptr_t ModuleBase, const std::uintptr_t ModuleEnd, const bool UseStoredLowLane)
 	{
 		std::vector<DiscoveryVectorProgram> Programs;
 		for (std::size_t Offset = 0; Offset + 16 < Span; ++Offset)
 		{
 			DiscoveryVectorProgram Candidate;
-			if (!ParseDiscoveryVectorProgram(Dispatcher, Span, Offset, ModuleBase, ModuleEnd, Candidate))
+			if (!ParseDiscoveryVectorProgram(Dispatcher, Span, Offset, ModuleBase, ModuleEnd, UseStoredLowLane, Candidate))
 				continue;
 			if (std::find_if(Programs.begin(), Programs.end(), [&](const DiscoveryVectorProgram& Existing) { return SameDiscoveryVectorProgram(Existing, Candidate); }) == Programs.end())
 				Programs.push_back(std::move(Candidate));
 		}
 
-		if (Programs.size() != 1)
-		{
-			std::cerr << std::format("Discovery vector extractor found {} distinct candidate programs\n", Programs.size());
-			for (const DiscoveryVectorProgram& Program : Programs)
-				std::cerr << std::format("  candidate: address +0x{:X}, data +0x{:X}, stride 0x{:X}, input xmm{}, {} instructions\n", Program.AddressOffset, Program.DataOffset, Program.Stride, Program.InputRegister, Program.Instructions.size());
-			return false;
-		}
-
-		Result = std::move(Programs[0]);
-		return true;
+		return Programs;
 	}
 
-	bool InitializeDiscoveryUObjectDecoder(const std::uint8_t* Dispatcher, const std::uintptr_t ModuleBase, const std::uintptr_t ModuleEnd)
+	bool ValidateDiscoveryUObjectProgram(const DiscoveryVectorProgram& Program)
 	{
-		const std::size_t Span = GetReadableSpan(Dispatcher, 0x800);
-		DiscoveryVectorProgram Program;
-		if (!FindDiscoveryVectorProgram(Dispatcher, Span, ModuleBase, ModuleEnd, Program))
-			return false;
+		Discovery::UObjectDecoderReady = false;
+		Discovery::ProtectedHashReady = false;
 		if (Program.HashInstructions.empty() || Program.HashInstructions.size() > Discovery::ProtectedHashProgram.size() || Program.Instructions.empty() || Program.Instructions.size() > Discovery::ProtectedSlotProgram.size())
-		{
-			std::cerr << std::format("Discovery instruction program failed structural validation: {} scalar and {} vector instructions\n", Program.HashInstructions.size(), Program.Instructions.size());
 			return false;
-		}
-		std::cerr << std::format("Discovery instruction programs extracted: {} scalar instructions, input xmm{}, {} vector instructions\n", Program.HashInstructions.size(), Program.InputRegister, Program.Instructions.size());
 
 		Discovery::ProtectedAddressOffset = Program.AddressOffset;
 		Discovery::ProtectedHashProgramSize = static_cast<std::uint32_t>(Program.HashInstructions.size());
@@ -773,6 +703,9 @@ namespace
 			const int32 Index = static_cast<int32>((static_cast<std::int64_t>(Sample) * NumObjects) / std::min(DesiredSamples, NumObjects));
 			const UEObject Object = ObjectArray::GetByIndex(Index);
 			if (!Object)
+				continue;
+			const auto* ObjectBytes = static_cast<const std::uint8_t*>(Object.GetAddress());
+			if (Platform::IsBadReadPtr(ObjectBytes + Program.AddressOffset + sizeof(std::uintptr_t) - 1) || Platform::IsBadReadPtr(ObjectBytes + Program.DataOffset + (3 * Program.Stride) + 15))
 				continue;
 
 			const std::uint32_t BaseSlot = Discovery::GetProtectedSlot(Object.GetAddress()) & 0x3;
@@ -863,6 +796,12 @@ namespace
 				return false;
 			}
 			const std::uint8_t NameSlot = NameCandidates[0];
+			const std::uint8_t NullSlot = NameCandidates[1];
+			if (BaseScores.NullValues[NullSlot] * 10 < BaseScores.Samples * 9)
+			{
+				std::cerr << std::format("Discovery selector validation found no stable empty slot in hash bucket {}\n", BaseSlot);
+				return false;
+			}
 
 			Discovery::ProtectedNameSlots[BaseSlot] = NameSlot;
 			Discovery::ProtectedClassSlots[BaseSlot] = ClassSlot;
@@ -872,6 +811,42 @@ namespace
 		Discovery::UObjectDecoderReady = true;
 		std::cerr << std::format("Discovery UObject selectors recovered: class [{},{},{},{}], outer [{},{},{},{}], name [{},{},{},{}]\n", Discovery::ProtectedClassSlots[0], Discovery::ProtectedClassSlots[1], Discovery::ProtectedClassSlots[2], Discovery::ProtectedClassSlots[3], Discovery::ProtectedOuterSlots[0], Discovery::ProtectedOuterSlots[1], Discovery::ProtectedOuterSlots[2], Discovery::ProtectedOuterSlots[3], Discovery::ProtectedNameSlots[0], Discovery::ProtectedNameSlots[1], Discovery::ProtectedNameSlots[2], Discovery::ProtectedNameSlots[3]);
 		return true;
+	}
+
+	bool InitializeDiscoveryUObjectDecoder(const std::uint8_t* Dispatcher, const std::uintptr_t ModuleBase, const std::uintptr_t ModuleEnd)
+	{
+		const std::size_t Span = GetReadableSpan(Dispatcher, 0x800);
+		if (Span < 0x100)
+			return false;
+
+		for (const bool UseStoredLowLane : { true, false })
+		{
+			const std::vector<DiscoveryVectorProgram> Programs = FindDiscoveryVectorPrograms(Dispatcher, Span, ModuleBase, ModuleEnd, UseStoredLowLane);
+			std::vector<std::size_t> ValidPrograms;
+			for (std::size_t Index = 0; Index < Programs.size(); ++Index)
+			{
+				if (ValidateDiscoveryUObjectProgram(Programs[Index]))
+					ValidPrograms.push_back(Index);
+			}
+
+			if (ValidPrograms.size() > 1)
+			{
+				std::cerr << std::format("Discovery {} validation retained {} protected-slot layouts\n", UseStoredLowLane ? "stored-low-lane" : "instruction-decoder", ValidPrograms.size());
+				return false;
+			}
+			if (ValidPrograms.empty())
+				continue;
+
+			const DiscoveryVectorProgram& Program = Programs[ValidPrograms[0]];
+			if (!ValidateDiscoveryUObjectProgram(Program))
+				return false;
+
+			Discovery::UObjectUsesStoredLowLane = UseStoredLowLane;
+			std::cerr << std::format("Discovery UObject storage recovered through {}: {} scalar instructions, data +0x{:X}, stride 0x{:X}, {} vector instructions\n", UseStoredLowLane ? "structural low-lane validation" : "generic instruction extraction", Program.HashInstructions.size(), Program.DataOffset, Program.Stride, Program.Instructions.size());
+			return true;
+		}
+
+		return false;
 	}
 }
 
@@ -1016,7 +991,7 @@ void Off::InSDK::ProcessEvent::InitDiscoveryPE_Windows()
 	std::cerr << std::format("PE-Offset: 0x{:X}\n", PEOffset);
 	std::cerr << std::format("PE-Index: 0x{:X}\n", PEIndex);
 	std::cerr << std::format("Discovery UFunction::FunctionFlags recovered at +0x{:X}\n", Off::UFunction::FunctionFlags);
-	std::cerr << std::format("Discovery UObject decoder recovered: address +0x{:X}, slots +0x{:X}/0x{:X}, {} extracted vector instructions\n", Discovery::ProtectedAddressOffset, Discovery::ProtectedSlotDataOffset, Discovery::ProtectedSlotStride, Discovery::ProtectedSlotProgramSize);
+	std::cerr << std::format("Discovery UObject storage recovered: address +0x{:X}, slots +0x{:X}/0x{:X}, strategy {}, {} vector instructions\n", Discovery::ProtectedAddressOffset, Discovery::ProtectedSlotDataOffset, Discovery::ProtectedSlotStride, Discovery::UObjectUsesStoredLowLane ? "stored low qword" : "generic instruction program", Discovery::ProtectedSlotProgramSize);
 	std::cerr << std::format("Discovery ProcessEvent dispatcher validated at RVA 0x{:X}\n\n", DispatcherOffset);
 #endif // PLATFORM_WINDOWS
 }

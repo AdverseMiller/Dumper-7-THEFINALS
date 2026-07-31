@@ -11,7 +11,7 @@ The current chain is:
 3. Search committed writable memory for an aligned pointer equal to the first chunk. Treat each occurrence as a possible chunk table.
 4. Infer elements per chunk from `InternalIndex - slot` votes in the second chunk, with standard Unreal values retained only as fallback candidates. A candidate table is accepted only when its first entry is the independently found chunk and every consecutive chunk contains objects whose `InternalIndex` agrees with `(chunk index * elements per chunk) + slot`.
 5. Scan the final validated chunk backward and derive the enumeration limit from the highest live object whose stored `InternalIndex` matches its structural position.
-6. Extract the protected UObject address hash and slot decoder as bounded scalar and SIMD instruction programs and emulate those programs. Classify Class and Outer by decoded object-array membership and classify Name by its relative FName plausibility among the two remaining slots. Validate all four base-slot values over thousands of objects.
+6. Recover the protected UObject address hash and slot geometry from the dispatcher. First treat each slot's stored low qword as its value and classify Class and Outer by object-array membership, Name by relative FName plausibility, and the fourth lane by its stable zero value. Validate every hash bucket over thousands of objects. Only if that structural low-lane model fails does the older generic SIMD instruction extractor run; there is no build-specific cipher helper.
 7. Locate `FName::AppendString` semantically. Scan decoded executable pages for the numbered-name suffix operation, use the PE exception directory to recover each containing function boundary, and require that the same function resets the wide-string builder, reads `FName::Number`, appends UTF-16 `_`, and formats `Number - 1`. Require exactly one usable implementation.
 8. Walk a live UObject vtable, resolve wrapper call targets, and accept ProcessEvent only when the dispatcher has the expected repeated function-flag accesses and native/script branch semantics.
 9. Recover and cross-object validate `UFunction::FunctionFlags`, including its XOR key, plus `UFunction::ExecFunction`.
@@ -30,7 +30,7 @@ Each run writes `discovery-report.json` beside the SDK. It records the structura
 
 The generated C++ SDK is protector-aware where it needs to access UObject identity:
 
-- `UObject::GetClass()`, `GetOuter()`, and `GetFName()` contain the recovered decoder constants from that run.
+- `UObject::GetClass()`, `GetOuter()`, and `GetFName()` contain the recovered slot geometry and selector tables from that run, plus a generic decoder program only when the stored low lane is not already the value.
 - `UObject::HasTypeFlag()` and `IsA()` apply the recovered `UClass::CastFlags` XOR key rather than reading the protected member as plaintext;
 - generated UFunction wrappers use `GetClass()` rather than a nonexistent raw `Class` member;
 - protected UObject Class, Outer, and Name storage is padding, not falsely emitted as ordinary fields;
@@ -42,7 +42,7 @@ The generated C++ SDK is protector-aware where it needs to access UObject identi
 
 There is deliberately no generated stable `GObjects` RVA. `Offsets::GObjects` is zero and IDA mappings omit the symbol because the reconstructed chunk table is a session-specific heap allocation. Consumers that need runtime object enumeration must provide their own structural resolver or initialize the generated wrapper manually with a compatible object-array representation.
 
-The report is the authoritative record for protected reflection storage. It serializes the extracted scalar hash and SIMD decoder programs, including captured RIP-relative constants. A consumer that needs to inspect FField names or encoded FProperty members at runtime must implement the recorded decoder rather than treating those bytes as ordinary fields.
+The report is the authoritative record for protected reflection storage. It records whether UObject identity used structurally validated stored low lanes or the generic instruction fallback, and serializes the recovered hash and any required SIMD program. A consumer that needs to inspect FField names or encoded FProperty members at runtime must implement their separately recorded decoders rather than treating those bytes as ordinary fields.
 
 ## Validation, July 18-19 2026
 
@@ -101,6 +101,8 @@ On July 19, the fixed `FName::AppendString` prologue signature was replaced with
 The selector deliberately scans only decoded, readable pages. Protected pages that have not executed yet remain encrypted and inaccessible, so loading Dumper-7 before normal game initialization can produce `semantic scan found no decoded implementation`. That is a timing/precondition failure rather than permission to guess an RVA; the resolver remains fail closed.
 
 The generic protected-UObject extractor was also loaded against the archived 10.14 build. It recovered 21 scalar hash instructions and seven SIMD decoder instructions directly from the ProcessEvent dispatcher, captured the input register and constants, and validated Class, Outer, and Name selector maps over live objects. It then recovered the ProcessEvent wrapper at RVA `0x004AA0B0`, vtable index `0x4E`, dispatcher RVA `0x004BBFF0`, and `UFunction::FunctionFlags` at `+0x120`. No build-family identifier or fixed cipher recipe was used.
+
+On July 30, build `24438055` changed the slot accessor to call a carryless-multiply helper. Read-only sampling showed that the decoded result equaled the stored low qword for all 272 tested slots across 68 live UObjects; the upper qword acted as redundant validation data. The Dumper now tries the stored-low-lane model before parsing any SIMD transform, requires Class, Outer, Name, and empty-lane structure in all four hash buckets, and falls back only to the existing generic instruction extractor used by older builds. The build-specific carryless helper and key extraction were removed.
 
 The former 10.14 `UStruct::ChildProperties` failure was caused by an invalid ordering assumption in the stock pointer scan. That build stores `Children` at `+0x118`, while `ChildProperties` is earlier at `+0xC0`; starting the scan after `Children` could therefore never find it. The Discovery path scans a bounded UStruct member region and preserves every structurally valid property-chain head rather than choosing by position. The initial head is provisional and exists only to bootstrap the FField-name decoder. The final pass jointly resolves the head, link, and owner members from decoded names and ownership topology across many live structs. Executable head/link references provide a fail-closed tie-breaker for runtime-equivalent auxiliary property lists. Consequently, neither proximity to `PropertiesSize` nor being the first or last matching member is a resolver input.
 
