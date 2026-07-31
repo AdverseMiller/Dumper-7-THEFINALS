@@ -187,6 +187,7 @@ void Generator::WriteDiscoveryReport()
 	Report["uobject"]["protected_address_offset"] = Hex(Discovery::ProtectedAddressOffset);
 	Report["uobject"]["protected_data_offset"] = Hex(Discovery::ProtectedSlotDataOffset);
 	Report["uobject"]["protected_slot_stride"] = Hex(Discovery::ProtectedSlotStride);
+	Report["uobject"]["storage_strategy"] = Discovery::UObjectUsesStoredLowLane ? "structurally validated stored low qword" : "generic extracted instruction program";
 	Report["uobject"]["protected_vector_program"]["input_register"] = Discovery::ProtectedSlotInputRegister;
 	Report["uobject"]["protected_vector_program"]["instruction_count"] = Discovery::ProtectedSlotProgramSize;
 	for (std::uint32_t Index = 0; Index < Discovery::ProtectedSlotProgramSize; ++Index)

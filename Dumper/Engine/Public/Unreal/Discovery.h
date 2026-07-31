@@ -23,6 +23,7 @@ namespace Discovery
 	inline std::uint64_t PropertyFlagsXorKey = 0;
 
 	inline bool UObjectDecoderReady = false;
+	inline bool UObjectUsesStoredLowLane = false;
 	inline bool ProtectedHashReady = false;
 	inline std::uint32_t ProtectedAddressOffset = 0;
 
@@ -74,7 +75,6 @@ namespace Discovery
 		ShiftRightDwords,
 		ShiftLeftDwords,
 		AddDwords,
-		CarrylessDecode,
 	};
 
 	struct ProtectedVectorInstruction
@@ -93,19 +93,6 @@ namespace Discovery
 	inline std::array<std::uint8_t, 4> ProtectedClassSlots{};
 	inline std::array<std::uint8_t, 4> ProtectedOuterSlots{};
 	inline std::array<std::uint8_t, 4> ProtectedNameSlots{};
-
-	inline std::uint64_t CarrylessMultiplyLow(std::uint64_t Left, std::uint64_t Right)
-	{
-		std::uint64_t Result = 0;
-		while (Right)
-		{
-			if (Right & 1)
-				Result ^= Left;
-			Left <<= 1;
-			Right >>= 1;
-		}
-		return Result;
-	}
 
 	inline bool FieldNameDecoderReady = false;
 	inline std::uint32_t FieldNameOffset = 0;
@@ -247,23 +234,6 @@ namespace Discovery
 						Dwords[Dword] += SourceDwords[Dword];
 				}
 				std::memcpy(Destination.data(), Dwords.data(), Destination.size());
-				break;
-			}
-			case ProtectedVectorOpcode::CarrylessDecode:
-			{
-				std::uint64_t Low = 0;
-				std::uint64_t High = 0;
-				std::uint64_t FirstKey = 0;
-				std::uint64_t SecondKey = 0;
-				std::memcpy(&Low, Source.data(), sizeof(Low));
-				std::memcpy(&High, Source.data() + sizeof(Low), sizeof(High));
-				std::memcpy(&FirstKey, Instruction.Constant.data(), sizeof(FirstKey));
-				std::memcpy(&SecondKey, Instruction.Constant.data() + sizeof(FirstKey), sizeof(SecondKey));
-				const std::uint64_t Mixed = CarrylessMultiplyLow(SecondKey, Low) ^ High;
-				const std::uint64_t Decoded = Low ^ CarrylessMultiplyLow(FirstKey, Mixed);
-				Destination.fill(0);
-				std::memcpy(Destination.data(), &Decoded, sizeof(Decoded));
-				std::memcpy(Destination.data() + sizeof(Decoded), &Mixed, sizeof(Mixed));
 				break;
 			}
 			case ProtectedVectorOpcode::Or:
@@ -413,23 +383,6 @@ namespace Discovery
 						Dwords[Dword] += SourceDwords[Dword];
 				}
 				std::memcpy(Destination.data(), Dwords.data(), Destination.size());
-				break;
-			}
-			case ProtectedVectorOpcode::CarrylessDecode:
-			{
-				std::uint64_t Low = 0;
-				std::uint64_t High = 0;
-				std::uint64_t FirstKey = 0;
-				std::uint64_t SecondKey = 0;
-				std::memcpy(&Low, Source.data(), sizeof(Low));
-				std::memcpy(&High, Source.data() + sizeof(Low), sizeof(High));
-				std::memcpy(&FirstKey, Instruction.Constant.data(), sizeof(FirstKey));
-				std::memcpy(&SecondKey, Instruction.Constant.data() + sizeof(FirstKey), sizeof(SecondKey));
-				const std::uint64_t Mixed = CarrylessMultiplyLow(SecondKey, Low) ^ High;
-				const std::uint64_t Decoded = Low ^ CarrylessMultiplyLow(FirstKey, Mixed);
-				Destination.fill(0);
-				std::memcpy(Destination.data(), &Decoded, sizeof(Decoded));
-				std::memcpy(Destination.data() + sizeof(Decoded), &Mixed, sizeof(Mixed));
 				break;
 			}
 			case ProtectedVectorOpcode::ShuffleLowWords:

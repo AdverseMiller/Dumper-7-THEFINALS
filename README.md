@@ -7,7 +7,7 @@ The main goal of this fork is to take as much manual work as possible out of upd
 ## Features
 
 - Cipher-free object-array reconstruction.
-- Dynamic protected UObject and FField decoder extraction.
+- Structural protected UObject low-lane recovery with a generic decoder fallback for older layouts.
 - Semantic AppendString and ProcessEvent discovery.
 - Automated reflection-layout recovery.
 - Automatic ChildProperties, FField, FFieldClass, and FProperty resolution.
