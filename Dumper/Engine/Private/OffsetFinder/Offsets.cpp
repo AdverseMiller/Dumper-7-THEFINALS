@@ -82,8 +82,6 @@ namespace
 		if (Span < 0x100)
 			return false;
 		const std::uint8_t ProtectedObjectBaseRegister = FindDiscoveryProtectedObjectBaseRegister(Address, Span);
-		if (ProtectedObjectBaseRegister == 0xFF)
-			return false;
 
 		struct FlagRead
 		{
@@ -145,6 +143,20 @@ namespace
 			if ((Address[OpcodeOffset] & 0xF0) == 0x40)
 				Rex = Address[OpcodeOffset++];
 
+			if (OpcodeOffset + 2 <= Span && Address[OpcodeOffset] == 0xA8 && (Address[OpcodeOffset + 1] & 0x10))
+			{
+				NativeFlagTests[0] = true;
+				continue;
+			}
+			if (OpcodeOffset + 5 <= Span && Address[OpcodeOffset] == 0xA9)
+			{
+				std::uint32_t Immediate = 0;
+				std::memcpy(&Immediate, Address + OpcodeOffset + 1, sizeof(Immediate));
+				if (Immediate & 0x10)
+					NativeFlagTests[0] = true;
+				continue;
+			}
+
 			if (OpcodeOffset + 3 > Span || Address[OpcodeOffset] != 0xF6)
 				continue;
 
@@ -156,10 +168,22 @@ namespace
 		}
 
 		std::vector<int32> Candidates;
-		for (const FlagRead& Read : FlagReads)
+		const auto CollectCandidates = [&](const bool RequireProtectedObjectRegister)
 		{
-			if (Read.BaseRegister == ProtectedObjectBaseRegister && Read.Count >= 3 && NativeFlagTests[Read.DestinationRegister])
-				Candidates.push_back(Read.Displacement);
+			for (const FlagRead& Read : FlagReads)
+			{
+				const bool MatchesProtectedObject = !RequireProtectedObjectRegister || Read.BaseRegister == ProtectedObjectBaseRegister;
+				if (MatchesProtectedObject && Read.Count >= 3 && NativeFlagTests[Read.DestinationRegister])
+					Candidates.push_back(Read.Displacement);
+			}
+		};
+
+		if (ProtectedObjectBaseRegister != 0xFF)
+			CollectCandidates(true);
+		if (Candidates.size() != 1)
+		{
+			Candidates.clear();
+			CollectCandidates(false);
 		}
 
 		std::sort(Candidates.begin(), Candidates.end());
@@ -220,6 +244,20 @@ namespace
 			const std::uint8_t Opcode = *Cursor++;
 			if (Cursor >= End)
 				return false;
+			if (Opcode == 0x05)
+			{
+				if (Instructions.empty() || End - Cursor < 4)
+					return false;
+				Discovery::ProtectedScalarInstruction Instruction{};
+				Instruction.Opcode = Discovery::ProtectedScalarOpcode::AddImmediate;
+				Instruction.Destination = 0;
+				Instruction.Source = 0;
+				Instruction.Is64Bit = Is64Bit;
+				std::memcpy(&Instruction.Immediate, Cursor, sizeof(Instruction.Immediate));
+				Cursor += 4;
+				Instructions.push_back(Instruction);
+				continue;
+			}
 			const std::uint8_t ModRm = *Cursor++;
 			const std::uint8_t Mode = ModRm >> 6;
 			const std::uint8_t Register = ((ModRm >> 3) & 0x7) | ((Rex & 0x4) ? 0x8 : 0x0);
@@ -383,6 +421,70 @@ namespace
 		return true;
 	}
 
+	bool ParseDiscoveryCarrylessHelper(const std::uint8_t* Cursor, const std::uint8_t* End, const std::uintptr_t ModuleBase, const std::uintptr_t ModuleEnd, const std::uint8_t InputRegister, std::vector<Discovery::ProtectedVectorInstruction>& Instructions)
+	{
+		const std::uint8_t* SearchEnd = std::min(End, Cursor + 0x80);
+		std::uint64_t FirstKey = 0;
+		std::uint64_t SecondKey = 0;
+		bool HasFirstKey = false;
+		bool HasSecondKey = false;
+		for (const std::uint8_t* Instruction = Cursor; Instruction + 10 <= SearchEnd; ++Instruction)
+		{
+			if (Instruction[0] == 0x48 && Instruction[1] == 0xBA)
+			{
+				std::memcpy(&FirstKey, Instruction + 2, sizeof(FirstKey));
+				HasFirstKey = true;
+				continue;
+			}
+			if (Instruction[0] == 0x49 && Instruction[1] == 0xB8)
+			{
+				std::memcpy(&SecondKey, Instruction + 2, sizeof(SecondKey));
+				HasSecondKey = true;
+				continue;
+			}
+			if (Instruction[0] != 0xE8 || !HasFirstKey || !HasSecondKey)
+				continue;
+
+			std::int32_t Relative = 0;
+			std::memcpy(&Relative, Instruction + 1, sizeof(Relative));
+			const std::uint8_t* Helper = ResolveDirectJump(Instruction + 5 + Relative, ModuleBase, ModuleEnd);
+			const std::uintptr_t HelperAddress = reinterpret_cast<std::uintptr_t>(Helper);
+			if (!Helper || HelperAddress < ModuleBase || HelperAddress >= ModuleEnd)
+				continue;
+
+			const std::size_t HelperSpan = GetReadableSpan(Helper, 0x40);
+			if (HelperSpan < 0x20 || std::memcmp(Helper, "\x66\x0F\x6F\x01", 4) != 0)
+				continue;
+
+			int CarrylessMultiplyCount = 0;
+			bool HasReturn = false;
+			for (std::size_t Offset = 0; Offset < HelperSpan; ++Offset)
+			{
+				if (Offset + 3 <= HelperSpan && Helper[Offset] == 0x0F && Helper[Offset + 1] == 0x3A && Helper[Offset + 2] == 0x44)
+					++CarrylessMultiplyCount;
+				if (Helper[Offset] == 0xC3)
+					HasReturn = true;
+			}
+			if (CarrylessMultiplyCount != 2 || !HasReturn)
+				continue;
+
+			Discovery::ProtectedVectorInstruction Decode{};
+			Decode.Opcode = Discovery::ProtectedVectorOpcode::CarrylessDecode;
+			Decode.Destination = InputRegister;
+			Decode.Source = InputRegister;
+			std::memcpy(Decode.Constant.data(), &FirstKey, sizeof(FirstKey));
+			std::memcpy(Decode.Constant.data() + sizeof(FirstKey), &SecondKey, sizeof(SecondKey));
+			Instructions.push_back(Decode);
+			Instructions.push_back({
+				.Opcode = Discovery::ProtectedVectorOpcode::ReturnLowQword,
+				.Source = InputRegister,
+			});
+			return true;
+		}
+
+		return false;
+	}
+
 	bool ParseDiscoveryVectorProgram(const std::uint8_t* Dispatcher, const std::size_t Span, const std::size_t LoadOffset, const std::uintptr_t ModuleBase, const std::uintptr_t ModuleEnd, DiscoveryVectorProgram& Result)
 	{
 		const std::uint8_t* End = Dispatcher + Span;
@@ -488,6 +590,9 @@ namespace
 		}
 
 		Cursor = Dispatcher + LoadOffset + LoadLength;
+		if (ParseDiscoveryCarrylessHelper(Cursor, End, ModuleBase, ModuleEnd, InputRegister, Result.Instructions))
+			return true;
+
 		while (Cursor < End && Result.Instructions.size() < Discovery::ProtectedSlotProgram.size())
 		{
 			if (*Cursor != 0x66)
@@ -875,27 +980,37 @@ void Off::InSDK::ProcessEvent::InitDiscoveryPE_Windows()
 
 	if (Matches.empty())
 		throw std::runtime_error("Discovery ProcessEvent semantic dispatcher was not found in the UObject vtable");
-	if (Matches.size() != 1)
-		throw std::runtime_error(std::format("Discovery ProcessEvent semantic dispatcher matched {} UObject vtable entries", Matches.size()));
-	std::cerr << std::format("Discovery ProcessEvent candidate: wrapper RVA 0x{:X}, vtable index 0x{:X}, dispatcher RVA 0x{:X}, FunctionFlags +0x{:X}\n", Platform::GetOffset(Matches[0].Wrapper), Matches[0].Index, Platform::GetOffset(Matches[0].Dispatcher), Matches[0].FunctionFlagsOffset);
-	bool DecoderReady = false;
+
+	std::vector<Match> ValidatedMatches;
 	constexpr int32 DecoderAttempts = 20;
-	for (int32 Attempt = 0; Attempt < DecoderAttempts && !DecoderReady; ++Attempt)
+	for (const Match& Candidate : Matches)
 	{
-		DecoderReady = InitializeDiscoveryUObjectDecoder(Matches[0].Dispatcher, ModuleBase, ModuleEnd);
-		if (!DecoderReady && Attempt + 1 < DecoderAttempts)
+		if (InitializeDiscoveryUObjectDecoder(Candidate.Dispatcher, ModuleBase, ModuleEnd))
+			ValidatedMatches.push_back(Candidate);
+	}
+	for (int32 Attempt = 1; ValidatedMatches.empty() && Attempt < DecoderAttempts; ++Attempt)
+	{
+		std::cerr << std::format("Discovery UObject selector validation retry {}/{}\n", Attempt + 1, DecoderAttempts);
+		::Sleep(250);
+		for (const Match& Candidate : Matches)
 		{
-			std::cerr << std::format("Discovery UObject selector validation retry {}/{}\n", Attempt + 2, DecoderAttempts);
-			::Sleep(250);
+			if (InitializeDiscoveryUObjectDecoder(Candidate.Dispatcher, ModuleBase, ModuleEnd))
+				ValidatedMatches.push_back(Candidate);
 		}
 	}
-	if (!DecoderReady)
-		throw std::runtime_error("Discovery ProcessEvent dispatcher did not yield one consistent UObject protected-slot decoder after bounded retries");
 
-	PEIndex = Matches[0].Index;
-	PEOffset = static_cast<int32>(Platform::GetOffset(Matches[0].Wrapper));
-	Off::UFunction::FunctionFlags = Matches[0].FunctionFlagsOffset;
-	const std::uintptr_t DispatcherOffset = Platform::GetOffset(Matches[0].Dispatcher);
+	if (ValidatedMatches.empty())
+		throw std::runtime_error("Discovery ProcessEvent dispatcher did not yield one consistent UObject protected-slot decoder after bounded retries");
+	if (ValidatedMatches.size() != 1)
+		throw std::runtime_error(std::format("Discovery ProcessEvent decoder validation retained {} UObject vtable entries", ValidatedMatches.size()));
+
+	const Match& Match = ValidatedMatches[0];
+	std::cerr << std::format("Discovery ProcessEvent candidate: wrapper RVA 0x{:X}, vtable index 0x{:X}, dispatcher RVA 0x{:X}, FunctionFlags +0x{:X}\n", Platform::GetOffset(Match.Wrapper), Match.Index, Platform::GetOffset(Match.Dispatcher), Match.FunctionFlagsOffset);
+
+	PEIndex = Match.Index;
+	PEOffset = static_cast<int32>(Platform::GetOffset(Match.Wrapper));
+	Off::UFunction::FunctionFlags = Match.FunctionFlagsOffset;
+	const std::uintptr_t DispatcherOffset = Platform::GetOffset(Match.Dispatcher);
 	Discovery::ProcessEventDispatcherRva = DispatcherOffset;
 
 	std::cerr << std::format("PE-Offset: 0x{:X}\n", PEOffset);
@@ -1343,6 +1458,13 @@ void Off::Init()
 		OverwriteIfInvalidOffset(Off::DelegateProperty::SignatureFunction, Off::InSDK::Properties::PropertySize);
 	std::cerr << std::format("Off::DelegateProperty::SignatureFunction: 0x{:X}\n", Off::DelegateProperty::SignatureFunction) << std::endl;
 
+	Off::MulticastDelegateProperty::SignatureFunction = OffsetFinder::FindMulticastDelegatePropertySignatureFunctionOffset();
+	if (Discovery::Enabled)
+		RequireDiscoveryOffset(Off::MulticastDelegateProperty::SignatureFunction, "MulticastDelegateProperty::SignatureFunction");
+	else
+		OverwriteIfInvalidOffset(Off::MulticastDelegateProperty::SignatureFunction, Off::DelegateProperty::SignatureFunction);
+	std::cerr << std::format("Off::MulticastDelegateProperty::SignatureFunction: 0x{:X}\n", Off::MulticastDelegateProperty::SignatureFunction) << std::endl;
+
 	Off::ArrayProperty::Inner = OffsetFinder::FindInnerTypeOffset(Off::InSDK::Properties::PropertySize);
 	std::cerr << std::format("Off::ArrayProperty::Inner: 0x{:X}\n", Off::ArrayProperty::Inner);
 
@@ -1376,6 +1498,7 @@ void Off::Init()
 		RequireDerivedMember(Off::ByteProperty::Enum, "FByteProperty::Enum");
 		RequireDerivedMember(Off::StructProperty::Struct, "FStructProperty::Struct");
 		RequireDerivedMember(Off::DelegateProperty::SignatureFunction, "FDelegateProperty::SignatureFunction");
+		RequireDerivedMember(Off::MulticastDelegateProperty::SignatureFunction, "FMulticastDelegateProperty::SignatureFunction");
 		RequireDerivedMember(Off::ArrayProperty::Inner, "FArrayProperty::Inner");
 		RequireDerivedMember(Off::SetProperty::ElementProp, "FSetProperty::ElementProp");
 		RequireDerivedMember(Off::MapProperty::Base, "FMapProperty::Base");

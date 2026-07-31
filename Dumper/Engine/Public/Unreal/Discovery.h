@@ -73,6 +73,8 @@ namespace Discovery
 		AndNot,
 		ShiftRightDwords,
 		ShiftLeftDwords,
+		AddDwords,
+		CarrylessDecode,
 	};
 
 	struct ProtectedVectorInstruction
@@ -91,6 +93,19 @@ namespace Discovery
 	inline std::array<std::uint8_t, 4> ProtectedClassSlots{};
 	inline std::array<std::uint8_t, 4> ProtectedOuterSlots{};
 	inline std::array<std::uint8_t, 4> ProtectedNameSlots{};
+
+	inline std::uint64_t CarrylessMultiplyLow(std::uint64_t Left, std::uint64_t Right)
+	{
+		std::uint64_t Result = 0;
+		while (Right)
+		{
+			if (Right & 1)
+				Result ^= Left;
+			Left <<= 1;
+			Right >>= 1;
+		}
+		return Result;
+	}
 
 	inline bool FieldNameDecoderReady = false;
 	inline std::uint32_t FieldNameOffset = 0;
@@ -213,17 +228,42 @@ namespace Discovery
 			}
 			case ProtectedVectorOpcode::ShiftRightDwords:
 			case ProtectedVectorOpcode::ShiftLeftDwords:
+			case ProtectedVectorOpcode::AddDwords:
 			{
 				std::array<std::uint32_t, 4> Dwords{};
+				std::array<std::uint32_t, 4> SourceDwords{};
 				std::memcpy(Dwords.data(), Destination.data(), Destination.size());
+				std::memcpy(SourceDwords.data(), Source.data(), Source.size());
 				for (std::uint32_t& Dword : Dwords)
 				{
 					if (Instruction.Opcode == ProtectedVectorOpcode::ShiftRightDwords)
 						Dword >>= Instruction.Immediate;
-					else
+					else if (Instruction.Opcode == ProtectedVectorOpcode::ShiftLeftDwords)
 						Dword <<= Instruction.Immediate;
 				}
+				if (Instruction.Opcode == ProtectedVectorOpcode::AddDwords)
+				{
+					for (std::size_t Dword = 0; Dword < Dwords.size(); ++Dword)
+						Dwords[Dword] += SourceDwords[Dword];
+				}
 				std::memcpy(Destination.data(), Dwords.data(), Destination.size());
+				break;
+			}
+			case ProtectedVectorOpcode::CarrylessDecode:
+			{
+				std::uint64_t Low = 0;
+				std::uint64_t High = 0;
+				std::uint64_t FirstKey = 0;
+				std::uint64_t SecondKey = 0;
+				std::memcpy(&Low, Source.data(), sizeof(Low));
+				std::memcpy(&High, Source.data() + sizeof(Low), sizeof(High));
+				std::memcpy(&FirstKey, Instruction.Constant.data(), sizeof(FirstKey));
+				std::memcpy(&SecondKey, Instruction.Constant.data() + sizeof(FirstKey), sizeof(SecondKey));
+				const std::uint64_t Mixed = CarrylessMultiplyLow(SecondKey, Low) ^ High;
+				const std::uint64_t Decoded = Low ^ CarrylessMultiplyLow(FirstKey, Mixed);
+				Destination.fill(0);
+				std::memcpy(Destination.data(), &Decoded, sizeof(Decoded));
+				std::memcpy(Destination.data() + sizeof(Decoded), &Mixed, sizeof(Mixed));
 				break;
 			}
 			case ProtectedVectorOpcode::Or:
@@ -354,17 +394,42 @@ namespace Discovery
 			}
 			case ProtectedVectorOpcode::ShiftRightDwords:
 			case ProtectedVectorOpcode::ShiftLeftDwords:
+			case ProtectedVectorOpcode::AddDwords:
 			{
 				std::array<std::uint32_t, 4> Dwords{};
+				std::array<std::uint32_t, 4> SourceDwords{};
 				std::memcpy(Dwords.data(), Destination.data(), Destination.size());
+				std::memcpy(SourceDwords.data(), Source.data(), Source.size());
 				for (std::uint32_t& Dword : Dwords)
 				{
 					if (Instruction.Opcode == ProtectedVectorOpcode::ShiftRightDwords)
 						Dword >>= Instruction.Immediate;
-					else
+					else if (Instruction.Opcode == ProtectedVectorOpcode::ShiftLeftDwords)
 						Dword <<= Instruction.Immediate;
 				}
+				if (Instruction.Opcode == ProtectedVectorOpcode::AddDwords)
+				{
+					for (std::size_t Dword = 0; Dword < Dwords.size(); ++Dword)
+						Dwords[Dword] += SourceDwords[Dword];
+				}
 				std::memcpy(Destination.data(), Dwords.data(), Destination.size());
+				break;
+			}
+			case ProtectedVectorOpcode::CarrylessDecode:
+			{
+				std::uint64_t Low = 0;
+				std::uint64_t High = 0;
+				std::uint64_t FirstKey = 0;
+				std::uint64_t SecondKey = 0;
+				std::memcpy(&Low, Source.data(), sizeof(Low));
+				std::memcpy(&High, Source.data() + sizeof(Low), sizeof(High));
+				std::memcpy(&FirstKey, Instruction.Constant.data(), sizeof(FirstKey));
+				std::memcpy(&SecondKey, Instruction.Constant.data() + sizeof(FirstKey), sizeof(SecondKey));
+				const std::uint64_t Mixed = CarrylessMultiplyLow(SecondKey, Low) ^ High;
+				const std::uint64_t Decoded = Low ^ CarrylessMultiplyLow(FirstKey, Mixed);
+				Destination.fill(0);
+				std::memcpy(Destination.data(), &Decoded, sizeof(Decoded));
+				std::memcpy(Destination.data() + sizeof(Decoded), &Mixed, sizeof(Mixed));
 				break;
 			}
 			case ProtectedVectorOpcode::ShuffleLowWords:

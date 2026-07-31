@@ -16,6 +16,144 @@
 namespace
 {
 	std::vector<int32_t> DiscoveryChildPropertiesCandidates;
+
+	bool IsDiscoveryPropertyFieldPointer(const void* const Address)
+	{
+		if (!Address || (reinterpret_cast<std::uintptr_t>(Address) & (alignof(void*) - 1)))
+			return false;
+
+		const auto* Field = static_cast<const std::uint8_t*>(Address);
+		if (Platform::IsBadReadPtr(Field + Off::FField::Class + sizeof(void*) - 1))
+			return false;
+
+		const auto* FieldClass = *reinterpret_cast<const std::uint8_t* const*>(Field + Off::FField::Class);
+		if (!FieldClass || Platform::IsBadReadPtr(FieldClass + Off::FFieldClass::CastFlags + sizeof(std::uint64_t) - 1))
+			return false;
+
+		const auto CastFlags = *reinterpret_cast<const std::uint64_t*>(FieldClass + Off::FFieldClass::CastFlags);
+		return (CastFlags & static_cast<std::uint64_t>(EClassCastFlags::Property)) != 0;
+	}
+
+	bool IsDiscoveryObjectPointer(const void* const Address, const EClassCastFlags Type)
+	{
+		if (!Address || (reinterpret_cast<std::uintptr_t>(Address) & (alignof(void*) - 1)))
+			return false;
+
+		const auto* Object = static_cast<const std::uint8_t*>(Address);
+		const int32_t IndexOffset = static_cast<int32_t>(ObjectArray::GetInternalIndexOffset());
+		if (Platform::IsBadReadPtr(Object + IndexOffset + sizeof(int32_t) - 1))
+			return false;
+
+		const int32_t Index = *reinterpret_cast<const int32_t*>(Object + IndexOffset);
+		if (Index < 0 || Index >= ObjectArray::Num())
+			return false;
+
+		const UEObject IndexedObject = ObjectArray::GetByIndex(Index);
+		return IndexedObject.GetAddress() == Address && IndexedObject.IsA(Type);
+	}
+
+	int32_t FindDiscoveryDerivedPropertyPointers(const EClassCastFlags Type, const int32_t PointerCount, const int32_t PropertySize, const char* const Name)
+	{
+		std::vector<const std::uint8_t*> Properties;
+		for (const UEProperty Property : AllFieldIterator())
+		{
+			if (!Property || !Property.IsA(Type))
+				continue;
+			Properties.push_back(static_cast<const std::uint8_t*>(Property.GetAddress()));
+			if (Properties.size() == 128)
+				break;
+		}
+
+		if (Properties.size() < 8)
+		{
+			std::cerr << std::format("Discovery {} structural scan found only {} samples\n", Name, Properties.size());
+			return OffsetFinder::OffsetNotFound;
+		}
+
+		std::vector<int32_t> Candidates;
+		for (int32_t Offset = PropertySize; Offset <= PropertySize + 0x40; Offset += sizeof(void*))
+		{
+			bool MatchesAll = true;
+			for (const std::uint8_t* Property : Properties)
+			{
+				for (int32_t PointerIndex = 0; PointerIndex < PointerCount; ++PointerIndex)
+				{
+					const auto* PointerAddress = Property + Offset + PointerIndex * sizeof(void*);
+					if (Platform::IsBadReadPtr(PointerAddress + sizeof(void*) - 1))
+					{
+						MatchesAll = false;
+						break;
+					}
+					const void* const Value = *reinterpret_cast<void* const*>(PointerAddress);
+					if (!IsDiscoveryPropertyFieldPointer(Value))
+					{
+						MatchesAll = false;
+						break;
+					}
+				}
+				if (!MatchesAll)
+					break;
+			}
+			if (MatchesAll)
+				Candidates.push_back(Offset);
+		}
+
+		std::cerr << std::format("Discovery {} structural scan found {} candidate offsets from {} samples", Name, Candidates.size(), Properties.size());
+		for (const int32_t Candidate : Candidates)
+			std::cerr << std::format(" +0x{:X}", Candidate);
+		std::cerr << '\n';
+		return Candidates.size() == 1 ? Candidates[0] : OffsetFinder::OffsetNotFound;
+	}
+
+	int32_t FindDiscoveryObjectPropertyPointer(const EClassCastFlags PropertyType, const EClassCastFlags ObjectType, const int32_t PropertySize, const char* const Name)
+	{
+		std::vector<const std::uint8_t*> Properties;
+		for (const UEProperty Property : AllFieldIterator())
+		{
+			if (!Property || !Property.IsA(PropertyType))
+				continue;
+			Properties.push_back(static_cast<const std::uint8_t*>(Property.GetAddress()));
+			if (Properties.size() == 512)
+				break;
+		}
+		if (Properties.size() < 8)
+		{
+			std::cerr << std::format("Discovery {} scan found only {} samples\n", Name, Properties.size());
+			return OffsetFinder::OffsetNotFound;
+		}
+
+		struct Candidate
+		{
+			int32_t Offset = 0;
+			int Matches = 0;
+		};
+		std::vector<Candidate> Candidates;
+		for (int32_t Offset = PropertySize; Offset <= PropertySize + 0x40; Offset += sizeof(void*))
+		{
+			Candidate Current{ Offset };
+			for (const std::uint8_t* Property : Properties)
+			{
+				const auto* PointerAddress = Property + Offset;
+				if (Platform::IsBadReadPtr(PointerAddress + sizeof(void*) - 1))
+					continue;
+				if (IsDiscoveryObjectPointer(*reinterpret_cast<void* const*>(PointerAddress), ObjectType))
+					++Current.Matches;
+			}
+			if (Current.Matches >= 8)
+				Candidates.push_back(Current);
+		}
+
+		const int RequiredMatches = static_cast<int>((Properties.size() * 95 + 99) / 100);
+		std::erase_if(Candidates, [&](const Candidate& Candidate)
+		{
+			return Candidate.Matches < RequiredMatches;
+		});
+		std::cerr << std::format("Discovery {} scan found {} candidate offsets from {} samples", Name, Candidates.size(), Properties.size());
+		for (const Candidate& Candidate : Candidates)
+			std::cerr << std::format(" +0x{:X}[{}]", Candidate.Offset, Candidate.Matches);
+		std::cerr << '\n';
+		return Candidates.size() == 1 ? Candidates[0].Offset : OffsetFinder::OffsetNotFound;
+	}
 }
 
 /* UObject */
@@ -497,7 +635,6 @@ void OffsetFinder::InitDiscoveryFFieldLayout()
 			{
 				const std::uint8_t VectorOutput = Register;
 				std::uint8_t ScalarRegister = Rm;
-				bool FoundXor = false;
 				const std::uint8_t* ScalarEnd = std::min(RangeEnd, Cursor + 0x40);
 				for (const std::uint8_t* Scalar = Cursor; Scalar + 3 <= ScalarEnd; ++Scalar)
 				{
@@ -516,10 +653,9 @@ void OffsetFinder::InitDiscoveryFFieldLayout()
 						{
 							Result.ScalarXor = Immediate;
 							ScalarRegister = Destination;
-							FoundXor = true;
 						}
 					}
-					else if (FoundXor && Scalar[1] == 0xC1 && (Scalar[2] >> 6) == 3 && ((Scalar[2] >> 3) & 0x7) == 0)
+					else if (Scalar[1] == 0xC1 && (Scalar[2] >> 6) == 3 && ((Scalar[2] >> 3) & 0x7) == 0)
 					{
 						const std::uint8_t Destination = (Scalar[2] & 0x7) | ((ScalarRex & 0x1) ? 0x8 : 0x0);
 						if (Destination == ScalarRegister && Scalar[3] > 0 && Scalar[3] < 64)
@@ -577,6 +713,8 @@ void OffsetFinder::InitDiscoveryFFieldLayout()
 					Instruction.Opcode = Discovery::ProtectedVectorOpcode::Xor;
 				else if (!ThreeByteOpcode && Opcode == 0xFD)
 					Instruction.Opcode = Discovery::ProtectedVectorOpcode::AddWords;
+				else if (!ThreeByteOpcode && Opcode == 0xFE)
+					Instruction.Opcode = Discovery::ProtectedVectorOpcode::AddDwords;
 				else if (!ThreeByteOpcode && Opcode == 0xEB)
 					Instruction.Opcode = Discovery::ProtectedVectorOpcode::Or;
 				else if (!ThreeByteOpcode && Opcode == 0xDB)
@@ -730,6 +868,7 @@ void OffsetFinder::InitDiscoveryFFieldLayout()
 		int32 Owner = OffsetNotFound;
 		int StructMatches = 0;
 		int FieldMatches = 0;
+		int InvalidHeads = 0;
 		int References = 0;
 	};
 	std::vector<SemanticCandidate> SemanticCandidates;
@@ -798,23 +937,27 @@ void OffsetFinder::InitDiscoveryFFieldLayout()
 
 	for (SemanticCandidate& Candidate : SemanticCandidates)
 	{
-		int StructsInspected = 0;
 		for (const UEObject Object : ObjectArray())
 		{
-			if (StructsInspected >= 1024)
-				break;
-			if (!Object || !Object.IsA(EClassCastFlags::Struct))
+			if (!Object || (!Object.IsA(EClassCastFlags::Struct) && !Object.IsA(EClassCastFlags::Function)))
 				continue;
-			++StructsInspected;
 			const auto* StructAddress = static_cast<const std::uint8_t*>(Object.GetAddress());
 			if (Platform::IsBadReadPtr(StructAddress + Candidate.Head))
 				continue;
 			const auto* Head = *reinterpret_cast<const std::uint8_t* const*>(StructAddress + Candidate.Head);
 			if (!Head)
 				continue;
+			if (!IsField(Head))
+			{
+				++Candidate.InvalidHeads;
+				continue;
+			}
 			const auto Chain = ReadChain(Head, Candidate.Next);
 			if (Chain.empty())
+			{
+				++Candidate.InvalidHeads;
 				continue;
+			}
 
 			bool Valid = true;
 			std::set<std::uint64_t> Names;
@@ -837,7 +980,20 @@ void OffsetFinder::InitDiscoveryFFieldLayout()
 				++Candidate.StructMatches;
 				Candidate.FieldMatches += static_cast<int>(Chain.size());
 			}
+			else
+				++Candidate.InvalidHeads;
 		}
+	}
+	if (SemanticCandidates.size() > 1)
+	{
+		const int FewestInvalidHeads = std::min_element(SemanticCandidates.begin(), SemanticCandidates.end(), [](const SemanticCandidate& Left, const SemanticCandidate& Right)
+		{
+			return Left.InvalidHeads < Right.InvalidHeads;
+		})->InvalidHeads;
+		std::erase_if(SemanticCandidates, [&](const SemanticCandidate& Candidate)
+		{
+			return Candidate.InvalidHeads != FewestInvalidHeads;
+		});
 	}
 	if (SemanticCandidates.size() > 1)
 	{
@@ -955,7 +1111,7 @@ void OffsetFinder::InitDiscoveryFFieldLayout()
 
 	std::cerr << std::format("Discovery ChildProperties semantic scan matched {} head/link pairs", SemanticCandidates.size());
 	for (const SemanticCandidate& Candidate : SemanticCandidates)
-		std::cerr << std::format(" +0x{:X}/+0x{:X}/owner+0x{:X}/structs{}/fields{}/refs{}", Candidate.Head, Candidate.Next, Candidate.Owner, Candidate.StructMatches, Candidate.FieldMatches, Candidate.References);
+		std::cerr << std::format(" +0x{:X}/+0x{:X}/owner+0x{:X}/structs{}/fields{}/invalid{}/refs{}", Candidate.Head, Candidate.Next, Candidate.Owner, Candidate.StructMatches, Candidate.FieldMatches, Candidate.InvalidHeads, Candidate.References);
 	std::cerr << '\n';
 	if (SemanticCandidates.size() > 1)
 	{
@@ -972,6 +1128,11 @@ void OffsetFinder::InitDiscoveryFFieldLayout()
 	}
 	if (SemanticCandidates.size() != 1)
 		throw std::runtime_error(std::format("Discovery ChildProperties semantic scan matched {} candidates", SemanticCandidates.size()));
+	const int MaximumTransientInvalidHeads = std::max(16, SemanticCandidates[0].StructMatches / 1000);
+	if (SemanticCandidates[0].InvalidHeads > MaximumTransientInvalidHeads)
+		throw std::runtime_error(std::format("Discovery ChildProperties best candidate had {} invalid non-null heads, exceeding the transient-object limit of {}", SemanticCandidates[0].InvalidHeads, MaximumTransientInvalidHeads));
+	if (SemanticCandidates[0].InvalidHeads != 0)
+		std::cerr << std::format("Discovery ChildProperties accepted {} transient invalid heads across {} valid owners (limit {})\n", SemanticCandidates[0].InvalidHeads, SemanticCandidates[0].StructMatches, MaximumTransientInvalidHeads);
 
 	Off::UStruct::ChildProperties = SemanticCandidates[0].Head;
 	Off::FField::Next = SemanticCandidates[0].Next;
@@ -2227,6 +2388,9 @@ int32_t OffsetFinder::FindStructPropertyStructOffset()
 /* DelegateProperty */
 int32_t OffsetFinder::FindDelegatePropertySignatureFunctionOffset()
 {
+	if (Discovery::Enabled)
+		return FindDiscoveryObjectPropertyPointer(EClassCastFlags::DelegateProperty, EClassCastFlags::Function, Off::InSDK::Properties::PropertySize, "FDelegateProperty::SignatureFunction");
+
 	std::vector<std::pair<void*, const void*>> Infos;
 
 	const void* DelegateSignature = ObjectArray::FindObjectFast("TimerDynamicDelegate__DelegateSignature", EClassCastFlags::Function).GetAddress();
@@ -2248,11 +2412,21 @@ int32_t OffsetFinder::FindDelegatePropertySignatureFunctionOffset()
 	return FindOffset(Infos, Off::Property::Offset_Internal);
 }
 
+int32_t OffsetFinder::FindMulticastDelegatePropertySignatureFunctionOffset()
+{
+	if (Discovery::Enabled)
+		return FindDiscoveryObjectPropertyPointer(EClassCastFlags::MulticastInlineDelegateProperty, EClassCastFlags::Function, Off::InSDK::Properties::PropertySize, "FMulticastDelegateProperty::SignatureFunction");
+
+	return Off::DelegateProperty::SignatureFunction;
+}
+
 /* ArrayProperty */
 int32_t OffsetFinder::FindInnerTypeOffset(const int32 PropertySize)
 {
 	if (!Settings::Internal::bUseFProperty)
 		return PropertySize;
+	if (Discovery::Enabled)
+		return FindDiscoveryDerivedPropertyPointers(EClassCastFlags::ArrayProperty, 1, PropertySize, "FArrayProperty::Inner");
 
 	if (const UEProperty Property = ObjectArray::FindClassFast("GameViewportClient").FindMember("DebugProperties", EClassCastFlags::ArrayProperty))
 	{
@@ -2270,6 +2444,8 @@ int32_t OffsetFinder::FindSetPropertyBaseOffset(const int32 PropertySize)
 {
 	if (!Settings::Internal::bUseFProperty)
 		return PropertySize;
+	if (Discovery::Enabled)
+		return FindDiscoveryDerivedPropertyPointers(EClassCastFlags::SetProperty, 1, PropertySize, "FSetProperty::ElementProp");
 
 	if (const auto Object = ObjectArray::FindStructFast("LevelCollection").FindMember("Levels", EClassCastFlags::SetProperty))
 	{
@@ -2288,6 +2464,8 @@ int32_t OffsetFinder::FindMapPropertyBaseOffset(const int32 PropertySize)
 {
 	if (!Settings::Internal::bUseFProperty)
 		return PropertySize;
+	if (Discovery::Enabled)
+		return FindDiscoveryDerivedPropertyPointers(EClassCastFlags::MapProperty, 2, PropertySize, "FMapProperty::Key/Value");
 
 	if (const auto Object = ObjectArray::FindClassFast("UserDefinedEnum").FindMember("DisplayNameMap", EClassCastFlags::MapProperty))
 	{

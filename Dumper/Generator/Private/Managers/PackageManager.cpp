@@ -124,6 +124,9 @@ namespace PackageManagerUtils
 {
 	void GetPropertyDependency(UEProperty Prop, std::unordered_set<int32>& Store)
 	{
+		if (!Prop)
+			throw std::runtime_error("Package dependency traversal encountered a null nested property");
+
 		if (Prop.IsA(EClassCastFlags::StructProperty))
 		{
 			Store.insert(Prop.Cast<UEStructProperty>().GetUnderlayingStruct().GetIndex());

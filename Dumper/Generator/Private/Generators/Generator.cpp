@@ -169,6 +169,17 @@ void Generator::WriteDiscoveryReport()
 	Report["process_event"]["function_flags_offset"] = Hex(Off::UFunction::FunctionFlags);
 	Report["process_event"]["function_flags_xor"] = Hex(Discovery::FunctionFlagsXorKey);
 
+	Report["property_layout"]["size"] = Hex(Off::InSDK::Properties::PropertySize);
+	Report["property_layout"]["object_class_offset"] = Hex(Off::ObjectProperty::PropertyClass);
+	Report["property_layout"]["byte_enum_offset"] = Hex(Off::ByteProperty::Enum);
+	Report["property_layout"]["struct_offset"] = Hex(Off::StructProperty::Struct);
+	Report["property_layout"]["delegate_signature_offset"] = Hex(Off::DelegateProperty::SignatureFunction);
+	Report["property_layout"]["multicast_delegate_signature_offset"] = Hex(Off::MulticastDelegateProperty::SignatureFunction);
+	Report["property_layout"]["array_inner_offset"] = Hex(Off::ArrayProperty::Inner);
+	Report["property_layout"]["set_element_offset"] = Hex(Off::SetProperty::ElementProp);
+	Report["property_layout"]["map_key_offset"] = Hex(Off::MapProperty::Base);
+	Report["property_layout"]["map_value_offset"] = Hex(Off::MapProperty::Base + sizeof(void*));
+
 	Report["uobject"]["flags_offset"] = Hex(Off::UObject::Flags);
 	Report["uobject"]["index_offset"] = Hex(Off::UObject::Index);
 	Report["uclass"]["cast_flags_offset"] = Hex(Off::UClass::CastFlags);
