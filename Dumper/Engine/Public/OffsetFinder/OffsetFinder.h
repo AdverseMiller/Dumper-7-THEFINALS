@@ -148,6 +148,7 @@ namespace OffsetFinder
 
 	/* DelegateProperty */
 	int32_t FindDelegatePropertySignatureFunctionOffset();
+	int32_t FindMulticastDelegatePropertySignatureFunctionOffset();
 
 	/* ArrayProperty */
 	int32_t FindInnerTypeOffset(const int32 PropertySize);

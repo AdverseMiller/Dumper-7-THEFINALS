@@ -142,7 +142,7 @@ namespace
 		};
 
 		bool bFound = false;
-		const auto ScanMemory = [&](const bool LikelyChunkRegionsOnly)
+		const auto ScanMemory = [&](const bool LikelyChunkRegionsOnly, const std::size_t MaximumSnapshotSize)
 		{
 			Platform::IterateMemoryRegionsWithCallback([&](void* Base, const size_t Size) -> bool
 			{
@@ -175,11 +175,13 @@ namespace
 				}
 
 				auto* Region = static_cast<std::uint8_t*>(Base);
-				std::vector<std::uint8_t> Snapshot(Size);
+				const std::size_t SnapshotSize = std::min(Size, MaximumSnapshotSize);
+				std::vector<std::uint8_t> Snapshot(SnapshotSize);
 				if (!TryReadMemory(Region, Snapshot.data(), Snapshot.size()))
 					return false;
 
-				for (size_t Offset = 0; Offset + 0x2000 < Size; Offset += sizeof(std::uint32_t))
+				const std::size_t RequiredTail = SnapshotSize == Size ? 0x2000 : 0x100;
+				for (size_t Offset = 0; Offset + RequiredTail < SnapshotSize; Offset += sizeof(std::uint32_t))
 				{
 					auto* Candidate = Region + Offset;
 					const std::uint8_t* FirstObject = nullptr;
@@ -188,7 +190,7 @@ namespace
 					if (!IsPlausibleObject(FirstObject, ModuleBase, ModuleEnd))
 						continue;
 
-					for (std::uint32_t IndexOffset = 0x8; IndexOffset <= 0x40; IndexOffset += sizeof(std::uint32_t))
+					for (std::uint32_t IndexOffset = 0x8; IndexOffset <= 0x100; IndexOffset += sizeof(std::uint32_t))
 					{
 						std::int32_t FirstIndex = 0;
 						if (!TryReadValue(FirstObject + IndexOffset, FirstIndex))
@@ -224,9 +226,11 @@ namespace
 			}, true);
 		};
 
-		ScanMemory(true);
+		ScanMemory(true, 0x2000);
 		if (!bFound)
-			ScanMemory(false);
+			ScanMemory(true, std::numeric_limits<std::size_t>::max());
+		if (!bFound)
+			ScanMemory(false, std::numeric_limits<std::size_t>::max());
 
 		return bFound;
 	}

@@ -277,6 +277,11 @@ namespace Off
 		inline int32 SignatureFunction;
 	}
 
+	namespace MulticastDelegateProperty
+	{
+		inline int32 SignatureFunction;
+	}
+
 	namespace MapProperty
 	{
 		struct UMapPropertyBase

@@ -4,6 +4,7 @@
 #include "Unreal/ObjectArray.h"
 #include "OffsetFinder/Offsets.h"
 #include "Unreal/Discovery.h"
+#include "Platform.h"
 
 namespace
 {
@@ -277,6 +278,14 @@ std::string UEFField::GetCppName() const
 
 UEFField::operator bool() const
 {
+	if (Discovery::Enabled)
+	{
+		if (!Field || (reinterpret_cast<std::uintptr_t>(Field) & (alignof(void*) - 1)) || Platform::IsBadReadPtr(Field + Off::FField::Class + sizeof(void*) - 1))
+			return false;
+		const auto* FieldClass = *reinterpret_cast<const std::uint8_t* const*>(Field + Off::FField::Class);
+		return FieldClass && !Platform::IsBadReadPtr(FieldClass + Off::FFieldClass::CastFlags + sizeof(std::uint64_t) - 1);
+	}
+
 	return Field != nullptr && reinterpret_cast<void*>(Field + Off::FField::Class) != nullptr;
 }
 
@@ -1482,8 +1491,7 @@ std::string UEDelegateProperty::GetCppType() const
 
 UEFunction UEMulticastInlineDelegateProperty::GetSignatureFunction() const
 {
-	// Uses "Off::DelegateProperty::SignatureFunction" on purpose
-	return UEFunction(*reinterpret_cast<void**>(Base + Off::DelegateProperty::SignatureFunction));
+	return UEFunction(*reinterpret_cast<void**>(Base + Off::MulticastDelegateProperty::SignatureFunction));
 }
 
 std::string UEMulticastInlineDelegateProperty::GetCppType() const
