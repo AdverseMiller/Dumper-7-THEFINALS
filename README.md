@@ -28,8 +28,11 @@ This fork has been tested successfully against numerous game builds with very di
 - 10.14 (`23999122`)
 - 11.0 (`24101480`)
 - 11.1 (`24195074`)
+- 11.3 (`24438055`)
 
-Each completed the full SDK, mappings, IDA mappings, and Dumpspace pipeline. The generated CoreUObject SDK also passed its C++ layout assertions, and the game remained running after each final test.
+Each completed the full SDK, mappings, IDA mappings, and Dumpspace pipeline, and the game remained running after each final test. The earlier builds also passed the generated CoreUObject C++ layout assertions. Build `24438055` was instead validated through its reflected offsets, complete generated output, and parseable JSON reports because MinGW and MSVC reuse aligned base-class tail padding differently.
+
+The current target is Update 11.3.0, Steam build `24438055` (`discovery_11.03.x-CL-1327570`). Its July 30 rebuild changed the protected UObject slot accessor and moved several reflection members, but did not require a fixed global RVA or build-specific cipher. The completed live regression generated 3,777 files, including the C++ SDK, USMAP, IDA mappings, Dumpspace, object dumps, and a parseable `discovery-report.json`, while leaving the game process running and untraced. The current recovery path validates the stored low qword structurally across every UObject hash bucket and retains the generic extracted-instruction decoder only as a fallback for older layouts.
 
 For the full recovery chain and test results, see [Discovery automation](docs/discovery-automation.md).
 
