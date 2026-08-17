@@ -217,6 +217,22 @@ namespace
 		return nullptr;
 	}
 
+	bool PreservesDiscoveryProcessEventArguments(const std::uint8_t* Wrapper)
+	{
+		const std::size_t Span = GetReadableSpan(Wrapper, 0x80);
+		bool PreservesFunction = false;
+		bool PreservesParameters = false;
+		for (std::size_t Offset = 0; Offset + 5 <= Span; ++Offset)
+		{
+			const std::uint8_t* Code = Wrapper + Offset;
+			if (Code[0] == 0x48 && Code[1] == 0x89 && Code[2] == 0x54 && Code[3] == 0x24)
+				PreservesFunction = true;
+			if (Code[0] == 0x4C && Code[1] == 0x89 && Code[2] == 0x44 && Code[3] == 0x24)
+				PreservesParameters = true;
+		}
+		return PreservesFunction && PreservesParameters;
+	}
+
 	struct DiscoveryVectorProgram
 	{
 		std::uint32_t AddressOffset = 0;
@@ -227,7 +243,7 @@ namespace
 		std::vector<Discovery::ProtectedVectorInstruction> Instructions;
 	};
 
-	bool ParseDiscoveryScalarHashProgram(const std::uint8_t* Dispatcher, const std::size_t StartOffset, const std::size_t EndOffset, const std::uint8_t ObjectRegister, std::uint32_t& AddressOffset, std::vector<Discovery::ProtectedScalarInstruction>& Instructions)
+	bool ParseDiscoveryScalarHashProgram(const std::uint8_t* Dispatcher, const std::size_t StartOffset, const std::size_t EndOffset, const std::uint8_t ObjectRegister, std::uint32_t& AddressOffset, std::vector<Discovery::ProtectedScalarInstruction>& Instructions, std::size_t* ParsedEndOffset = nullptr)
 	{
 		const std::uint8_t* Cursor = Dispatcher + StartOffset;
 		const std::uint8_t* End = Dispatcher + EndOffset;
@@ -371,6 +387,8 @@ namespace
 						.Opcode = Discovery::ProtectedScalarOpcode::Return,
 						.Source = Rm,
 					});
+					if (ParsedEndOffset)
+						*ParsedEndOffset = static_cast<std::size_t>(Cursor - Dispatcher);
 					return true;
 				}
 				else
@@ -389,6 +407,207 @@ namespace
 		}
 
 		return false;
+	}
+
+	std::uint64_t DiscoveryCarrylessMultiplyLowQword(const std::uint64_t Left, const std::uint64_t Right)
+	{
+		std::uint64_t Result = 0;
+		for (std::uint32_t Bit = 0; Bit < 64; ++Bit)
+		{
+			if ((Right >> Bit) & 1)
+				Result ^= Left << Bit;
+		}
+		return Result;
+	}
+
+	bool IsDiscoveryCarrylessMultiplyHelper(const std::uint8_t* Address, const std::uintptr_t ModuleBase, const std::uintptr_t ModuleEnd)
+	{
+		static constexpr std::array<std::uint8_t, 22> Pattern = {
+			0x66, 0x48, 0x0F, 0x6E, 0xC1,
+			0x66, 0x48, 0x0F, 0x6E, 0xCA,
+			0x66, 0x0F, 0x3A, 0x44, 0xC8, 0x00,
+			0x66, 0x48, 0x0F, 0x7E, 0xC8,
+			0xC3,
+		};
+		const std::uintptr_t Value = reinterpret_cast<std::uintptr_t>(Address);
+		return Value >= ModuleBase && Value + Pattern.size() <= ModuleEnd && GetReadableSpan(Address, Pattern.size()) >= Pattern.size() && std::memcmp(Address, Pattern.data(), Pattern.size()) == 0;
+	}
+
+	std::vector<std::uint64_t> FindDiscoveryScalarXorKeys(const std::uint8_t* Dispatcher, const std::size_t Span, const std::uintptr_t ModuleBase, const std::uintptr_t ModuleEnd)
+	{
+		std::vector<std::uint64_t> Keys;
+		for (std::size_t Offset = 0; Offset + 25 <= Span; ++Offset)
+		{
+			const std::uint8_t* Code = Dispatcher + Offset;
+			if (Code[0] != 0x48 || Code[1] != 0xB9 || Code[10] != 0x48 || Code[11] != 0xBA || Code[20] != 0xE8)
+				continue;
+
+			std::int32_t Relative = 0;
+			std::memcpy(&Relative, Code + 21, sizeof(Relative));
+			const std::uint8_t* Helper = ResolveDirectJump(Code + 25 + Relative, ModuleBase, ModuleEnd);
+			if (!Helper || !IsDiscoveryCarrylessMultiplyHelper(Helper, ModuleBase, ModuleEnd))
+				continue;
+
+			std::uint64_t Left = 0;
+			std::uint64_t Right = 0;
+			std::memcpy(&Left, Code + 2, sizeof(Left));
+			std::memcpy(&Right, Code + 12, sizeof(Right));
+			const std::uint64_t Key = DiscoveryCarrylessMultiplyLowQword(Left, Right);
+			if (std::find(Keys.begin(), Keys.end(), Key) == Keys.end())
+				Keys.push_back(Key);
+		}
+		return Keys;
+	}
+
+	bool ParseDiscoveryScalarSlotLayout(const std::uint8_t* Dispatcher, const std::size_t Span, const std::size_t StartOffset, const std::uint8_t ObjectRegister, DiscoveryVectorProgram& Result)
+	{
+		std::uint32_t AddressOffset = 0;
+		std::size_t ParsedEndOffset = 0;
+		std::vector<Discovery::ProtectedScalarInstruction> HashInstructions;
+		if (!ParseDiscoveryScalarHashProgram(Dispatcher, StartOffset, Span, ObjectRegister, AddressOffset, HashInstructions, &ParsedEndOffset) || HashInstructions.empty())
+			return false;
+
+		const std::uint8_t HashRegister = HashInstructions.back().Source;
+		const std::uint8_t* Cursor = Dispatcher + ParsedEndOffset;
+		const std::uint8_t* End = Dispatcher + Span;
+		std::uint8_t Rex = 0;
+		if (Cursor < End && (*Cursor & 0xF0) == 0x40)
+			Rex = *Cursor++;
+		if (End - Cursor < 3 || Cursor[0] != 0xC1)
+			return false;
+		const std::uint8_t ShiftModRm = Cursor[1];
+		const std::uint8_t ShiftRegister = (ShiftModRm & 0x7) | ((Rex & 0x1) ? 0x8 : 0x0);
+		if ((ShiftModRm & 0xF8) != 0xE0 || ShiftRegister != HashRegister || Cursor[2] >= 8)
+			return false;
+		const std::uint32_t Stride = 1u << Cursor[2];
+		if (Stride < 0x10 || Stride > 0x100)
+			return false;
+		Cursor += 3;
+
+		const std::uint8_t* DirectLoadSearchEnd = std::min(End, Cursor + 0x60);
+		for (const std::uint8_t* Candidate = Cursor; Candidate + 5 <= DirectLoadSearchEnd; ++Candidate)
+		{
+			const std::uint8_t* Load = Candidate;
+			std::uint8_t LoadRex = 0;
+			if ((*Load & 0xF0) == 0x40)
+				LoadRex = *Load++;
+			if (!(LoadRex & 0x8) || Load + 4 > DirectLoadSearchEnd || (Load[0] != 0x8B && Load[0] != 0x33 && Load[0] != 0x39 && Load[0] != 0x3B))
+				continue;
+			const std::uint8_t LoadModRm = Load[1];
+			const std::uint8_t LoadMode = LoadModRm >> 6;
+			if ((LoadMode != 1 && LoadMode != 2) || (LoadModRm & 0x7) != 4)
+				continue;
+			const std::uint8_t LoadSib = Load[2];
+			const std::uint8_t LoadIndexRegister = ((LoadSib >> 3) & 0x7) | ((LoadRex & 0x2) ? 0x8 : 0x0);
+			const std::uint8_t LoadBaseRegister = (LoadSib & 0x7) | ((LoadRex & 0x1) ? 0x8 : 0x0);
+			if ((LoadSib >> 6) != 0 || !((LoadIndexRegister == ObjectRegister && LoadBaseRegister == HashRegister) || (LoadIndexRegister == HashRegister && LoadBaseRegister == ObjectRegister)))
+				continue;
+			std::int32_t DataOffset = 0;
+			if (LoadMode == 1)
+				DataOffset = static_cast<std::int8_t>(Load[3]);
+			else
+			{
+				if (Load + 7 > DirectLoadSearchEnd)
+					continue;
+				std::memcpy(&DataOffset, Load + 3, sizeof(DataOffset));
+			}
+			if (DataOffset <= 0 || DataOffset > 0x400)
+				continue;
+
+			Result = {};
+			Result.AddressOffset = AddressOffset;
+			Result.DataOffset = static_cast<std::uint32_t>(DataOffset);
+			Result.Stride = Stride;
+			Result.InputRegister = 0;
+			Result.HashInstructions = std::move(HashInstructions);
+			return true;
+		}
+
+		Rex = 0;
+		if (Cursor < End && (*Cursor & 0xF0) == 0x40)
+			Rex = *Cursor++;
+		if (End - Cursor < 3 || Cursor[0] != 0x8D)
+			return false;
+		const std::uint8_t LeaModRm = Cursor[1];
+		if ((LeaModRm >> 6) != 0 || (LeaModRm & 0x7) != 4)
+			return false;
+		const std::uint8_t AddressRegister = ((LeaModRm >> 3) & 0x7) | ((Rex & 0x4) ? 0x8 : 0x0);
+		const std::uint8_t Sib = Cursor[2];
+		const std::uint8_t IndexRegister = ((Sib >> 3) & 0x7) | ((Rex & 0x2) ? 0x8 : 0x0);
+		const std::uint8_t BaseRegister = (Sib & 0x7) | ((Rex & 0x1) ? 0x8 : 0x0);
+		if ((Sib >> 6) != 0 || !((IndexRegister == ObjectRegister && BaseRegister == HashRegister) || (IndexRegister == HashRegister && BaseRegister == ObjectRegister)))
+			return false;
+		Cursor += 3;
+
+		Rex = 0;
+		if (Cursor < End && (*Cursor & 0xF0) == 0x40)
+			Rex = *Cursor++;
+		if (End - Cursor < 3 || (Cursor[0] != 0x81 && Cursor[0] != 0x83))
+			return false;
+		const std::uint8_t AddModRm = Cursor[1];
+		const std::uint8_t AddRegister = (AddModRm & 0x7) | ((Rex & 0x1) ? 0x8 : 0x0);
+		if ((AddModRm & 0xF8) != 0xC0 || AddRegister != AddressRegister)
+			return false;
+		std::int32_t DataOffset = 0;
+		if (Cursor[0] == 0x83)
+			DataOffset = static_cast<std::int8_t>(Cursor[2]);
+		else
+		{
+			if (End - Cursor < 6)
+				return false;
+			std::memcpy(&DataOffset, Cursor + 2, sizeof(DataOffset));
+		}
+		if (DataOffset <= 0 || DataOffset > 0x400)
+			return false;
+
+		Result = {};
+		Result.AddressOffset = AddressOffset;
+		Result.DataOffset = static_cast<std::uint32_t>(DataOffset);
+		Result.Stride = Stride;
+		Result.InputRegister = 0;
+		Result.HashInstructions = std::move(HashInstructions);
+		return true;
+	}
+
+	std::vector<DiscoveryVectorProgram> FindDiscoveryScalarXorPrograms(const std::uint8_t* Dispatcher, const std::size_t Span, const std::uintptr_t ModuleBase, const std::uintptr_t ModuleEnd)
+	{
+		std::vector<DiscoveryVectorProgram> Layouts;
+		for (std::size_t Offset = 0; Offset + 64 < Span; ++Offset)
+		{
+			for (std::uint8_t ObjectRegister = 0; ObjectRegister < 16; ++ObjectRegister)
+			{
+				DiscoveryVectorProgram Layout;
+				if (!ParseDiscoveryScalarSlotLayout(Dispatcher, Span, Offset, ObjectRegister, Layout))
+					continue;
+				if (std::find_if(Layouts.begin(), Layouts.end(), [&](const DiscoveryVectorProgram& Existing) { return Existing.AddressOffset == Layout.AddressOffset && Existing.DataOffset == Layout.DataOffset && Existing.Stride == Layout.Stride; }) == Layouts.end())
+					Layouts.push_back(std::move(Layout));
+			}
+		}
+
+		const std::vector<std::uint64_t> Keys = FindDiscoveryScalarXorKeys(Dispatcher, Span, ModuleBase, ModuleEnd);
+		static std::unordered_set<const std::uint8_t*> ReportedDispatchers;
+		if (ReportedDispatchers.insert(Dispatcher).second)
+			std::cerr << std::format("Discovery scalar helper extractor at RVA 0x{:X} found {} slot layouts and {} candidate keys across 0x{:X} bytes\n", reinterpret_cast<std::uintptr_t>(Dispatcher) - ModuleBase, Layouts.size(), Keys.size(), Span);
+		std::vector<DiscoveryVectorProgram> Programs;
+		for (const DiscoveryVectorProgram& Layout : Layouts)
+		{
+			for (const std::uint64_t Key : Keys)
+			{
+				DiscoveryVectorProgram Program = Layout;
+				Discovery::ProtectedVectorInstruction Xor{};
+				Xor.Opcode = Discovery::ProtectedVectorOpcode::Xor;
+				Xor.Destination = 0;
+				Xor.SourceIsConstant = true;
+				std::memcpy(Xor.Constant.data(), &Key, sizeof(Key));
+				Program.Instructions.push_back(Xor);
+				Program.Instructions.push_back({
+					.Opcode = Discovery::ProtectedVectorOpcode::ReturnLowQword,
+					.Source = 0,
+				});
+				Programs.push_back(std::move(Program));
+			}
+		}
+		return Programs;
 	}
 
 	bool SameDiscoveryVectorInstruction(const Discovery::ProtectedVectorInstruction& Left, const Discovery::ProtectedVectorInstruction& Right)
@@ -815,9 +1034,31 @@ namespace
 
 	bool InitializeDiscoveryUObjectDecoder(const std::uint8_t* Dispatcher, const std::uintptr_t ModuleBase, const std::uintptr_t ModuleEnd)
 	{
-		const std::size_t Span = GetReadableSpan(Dispatcher, 0x800);
+		const std::size_t Span = GetReadableSpan(Dispatcher, 0x1800);
 		if (Span < 0x100)
 			return false;
+
+		const std::vector<DiscoveryVectorProgram> ScalarPrograms = FindDiscoveryScalarXorPrograms(Dispatcher, Span, ModuleBase, ModuleEnd);
+		std::vector<std::size_t> ValidScalarPrograms;
+		for (std::size_t Index = 0; Index < ScalarPrograms.size(); ++Index)
+		{
+			if (ValidateDiscoveryUObjectProgram(ScalarPrograms[Index]))
+				ValidScalarPrograms.push_back(Index);
+		}
+		if (ValidScalarPrograms.size() > 1)
+		{
+			std::cerr << std::format("Discovery scalar-XOR validation retained {} protected-slot layouts\n", ValidScalarPrograms.size());
+			return false;
+		}
+		if (ValidScalarPrograms.size() == 1)
+		{
+			const DiscoveryVectorProgram& Program = ScalarPrograms[ValidScalarPrograms[0]];
+			if (!ValidateDiscoveryUObjectProgram(Program))
+				return false;
+			Discovery::UObjectUsesStoredLowLane = false;
+			std::cerr << std::format("Discovery UObject storage recovered through scalar helper extraction: {} scalar instructions, data +0x{:X}, stride 0x{:X}\n", Program.HashInstructions.size(), Program.DataOffset, Program.Stride);
+			return true;
+		}
 
 		for (const bool UseStoredLowLane : { true, false })
 		{
@@ -955,6 +1196,18 @@ void Off::InSDK::ProcessEvent::InitDiscoveryPE_Windows()
 
 	if (Matches.empty())
 		throw std::runtime_error("Discovery ProcessEvent semantic dispatcher was not found in the UObject vtable");
+	if (Matches.size() > 1)
+	{
+		std::vector<Match> AbiMatches;
+		std::copy_if(Matches.begin(), Matches.end(), std::back_inserter(AbiMatches), [](const Match& Candidate) { return PreservesDiscoveryProcessEventArguments(Candidate.Wrapper); });
+		if (AbiMatches.size() == 1)
+		{
+			Matches = std::move(AbiMatches);
+			std::cerr << std::format("Discovery ProcessEvent ABI argument preservation selected vtable index 0x{:X}\n", Matches[0].Index);
+		}
+	}
+	for (const Match& Candidate : Matches)
+		std::cerr << std::format("Discovery semantic ProcessEvent match: wrapper RVA 0x{:X}, vtable index 0x{:X}, dispatcher RVA 0x{:X}\n", Platform::GetOffset(Candidate.Wrapper), Candidate.Index, Platform::GetOffset(Candidate.Dispatcher));
 
 	std::vector<Match> ValidatedMatches;
 	constexpr int32 DecoderAttempts = 20;

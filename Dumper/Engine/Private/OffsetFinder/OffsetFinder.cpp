@@ -102,7 +102,11 @@ namespace
 		for (const int32_t Candidate : Candidates)
 			std::cerr << std::format(" +0x{:X}", Candidate);
 		std::cerr << '\n';
-		return Candidates.size() == 1 ? Candidates[0] : OffsetFinder::OffsetNotFound;
+		if (Candidates.empty())
+			return OffsetFinder::OffsetNotFound;
+		if (Candidates.size() > 1)
+			std::cerr << std::format("Discovery {} selected nearest derived-class member at +0x{:X}\n", Name, Candidates[0]);
+		return Candidates[0];
 	}
 
 	int32_t FindDiscoveryObjectPropertyPointer(const EClassCastFlags PropertyType, const EClassCastFlags ObjectType, const int32_t PropertySize, const char* const Name)
@@ -756,8 +760,147 @@ void OffsetFinder::InitDiscoveryFFieldLayout()
 		return false;
 	};
 
+	auto CarrylessMultiplyLowQword = [](const std::uint64_t Left, const std::uint64_t Right)
+	{
+		std::uint64_t Result = 0;
+		for (std::uint32_t Bit = 0; Bit < 64; ++Bit)
+		{
+			if ((Right >> Bit) & 1)
+				Result ^= Left << Bit;
+		}
+		return Result;
+	};
+
+	auto IsCarrylessMultiplyHelper = [&](const std::uint8_t* Address)
+	{
+		static constexpr std::array<std::uint8_t, 22> Pattern = {
+			0x66, 0x48, 0x0F, 0x6E, 0xC1,
+			0x66, 0x48, 0x0F, 0x6E, 0xCA,
+			0x66, 0x0F, 0x3A, 0x44, 0xC8, 0x00,
+			0x66, 0x48, 0x0F, 0x7E, 0xC8,
+			0xC3,
+		};
+		const std::uintptr_t Value = reinterpret_cast<std::uintptr_t>(Address);
+		return Value >= ModuleBase && Value + Pattern.size() <= ModuleEnd && !Platform::IsBadReadPtr(Address + Pattern.size() - 1) && std::memcmp(Address, Pattern.data(), Pattern.size()) == 0;
+	};
+
+	auto ParseScalarDecoder = [&](const std::uint8_t* Code, const std::uint8_t* RangeEnd, Decoder& Result)
+	{
+		if (Code + 25 > RangeEnd || Code[0] != 0x48 || Code[1] != 0xB9 || Code[10] != 0x48 || Code[11] != 0xBA || Code[20] != 0xE8)
+			return false;
+
+		std::int32_t Relative = 0;
+		std::memcpy(&Relative, Code + 21, sizeof(Relative));
+		const std::uint8_t* Helper = Code + 25 + Relative;
+		if (!IsCarrylessMultiplyHelper(Helper))
+			return false;
+
+		std::uint64_t Left = 0;
+		std::uint64_t Right = 0;
+		std::memcpy(&Left, Code + 2, sizeof(Left));
+		std::memcpy(&Right, Code + 12, sizeof(Right));
+		const std::uint64_t Key = CarrylessMultiplyLowQword(Left, Right);
+		const std::uint8_t* SearchEnd = std::min(RangeEnd, Code + 0x60);
+		for (const std::uint8_t* Scalar = Code + 25; Scalar + 4 <= SearchEnd; ++Scalar)
+		{
+			const std::uint8_t Rex = Scalar[0];
+			if ((Rex & 0xF8) != 0x48 || Scalar[1] != 0x33)
+				continue;
+			const std::uint8_t ModRm = Scalar[2];
+			const std::uint8_t Mode = ModRm >> 6;
+			const std::uint8_t Destination = ((ModRm >> 3) & 0x7) | ((Rex & 0x4) ? 0x8 : 0x0);
+			if ((Mode != 1 && Mode != 2) || Destination != 0)
+				continue;
+
+			const std::uint8_t* Displacement = Scalar + 3;
+			if ((ModRm & 0x7) == 4)
+			{
+				if (Displacement >= SearchEnd)
+					continue;
+				++Displacement;
+			}
+			std::int32_t NameOffset = 0;
+			if (Mode == 1)
+				NameOffset = static_cast<std::int8_t>(*Displacement++);
+			else
+			{
+				if (Displacement + 4 > SearchEnd)
+					continue;
+				std::memcpy(&NameOffset, Displacement, sizeof(NameOffset));
+				Displacement += 4;
+			}
+			if (NameOffset <= 0 || NameOffset > 0x100 || (NameOffset & 0x7))
+				continue;
+
+			const std::uint8_t* RotateEnd = std::min(SearchEnd, Displacement + 0x10);
+			for (const std::uint8_t* Rotate = Displacement; Rotate + 4 <= RotateEnd; ++Rotate)
+			{
+				if ((Rotate[0] & 0xF8) != 0x48 || Rotate[1] != 0xC1 || (Rotate[2] & 0xF8) != 0xC0 || Rotate[3] == 0 || Rotate[3] >= 64)
+					continue;
+				Result = {};
+				Result.NameOffset = static_cast<std::uint32_t>(NameOffset);
+				Result.InputRegister = 0;
+				Result.ScalarXor = Key;
+				Result.ScalarRotate = Rotate[3];
+				Result.Instructions.push_back({
+					.Opcode = Discovery::ProtectedVectorOpcode::ReturnLowQword,
+					.Source = 0,
+				});
+				return true;
+			}
+		}
+		return false;
+	};
+
 	std::vector<Decoder> ValidDecoders;
 	std::size_t ExtractedPrograms = 0;
+	auto ValidateDecoder = [&](const Decoder& Candidate)
+	{
+		Discovery::FieldNameOffset = Candidate.NameOffset;
+		Discovery::FieldNameInputRegister = Candidate.InputRegister;
+		Discovery::FieldNameProgramSize = static_cast<std::uint32_t>(Candidate.Instructions.size());
+		std::copy(Candidate.Instructions.begin(), Candidate.Instructions.end(), Discovery::FieldNameProgram.begin());
+		Discovery::FieldNameScalarXor = Candidate.ScalarXor;
+		Discovery::FieldNameScalarRotate = Candidate.ScalarRotate;
+
+		auto IsPlausibleName = [](const std::uint64_t Value)
+		{
+			return static_cast<std::uint32_t>(Value) > 0 && static_cast<std::uint32_t>(Value) < 0x04000000 && static_cast<std::uint32_t>(Value >> 32) < 0x00100000;
+		};
+		for (const int32_t HeadOffset : DiscoveryChildPropertiesCandidates)
+		{
+			const auto* GuidChild = *reinterpret_cast<const std::uint8_t* const*>(static_cast<const std::uint8_t*>(GuidObject.GetAddress()) + HeadOffset);
+			const auto* VectorChild = *reinterpret_cast<const std::uint8_t* const*>(static_cast<const std::uint8_t*>(VectorObject.GetAddress()) + HeadOffset);
+			const auto* ColorChild = *reinterpret_cast<const std::uint8_t* const*>(static_cast<const std::uint8_t*>(ColorObject.GetAddress()) + HeadOffset);
+			if (!GuidChild || !VectorChild || !ColorChild || Platform::IsBadReadPtr(GuidChild) || Platform::IsBadReadPtr(VectorChild) || Platform::IsBadReadPtr(ColorChild))
+				continue;
+			const std::uint64_t GuidRaw = Discovery::GetFieldName(GuidChild);
+			const std::uint64_t VectorRaw = Discovery::GetFieldName(VectorChild);
+			const std::uint64_t ColorRaw = Discovery::GetFieldName(ColorChild);
+			if (!IsPlausibleName(GuidRaw) || !IsPlausibleName(VectorRaw) || !IsPlausibleName(ColorRaw))
+				continue;
+			const std::string GuidName = FName(GuidRaw).ToString();
+			const std::string VectorName = FName(VectorRaw).ToString();
+			const std::string ColorName = FName(ColorRaw).ToString();
+			if ((GuidName == "A" || GuidName == "B" || GuidName == "C" || GuidName == "D") && (VectorName == "X" || VectorName == "Y" || VectorName == "Z") && (ColorName == "A" || ColorName == "B" || ColorName == "G" || ColorName == "R"))
+				return true;
+		}
+		return false;
+	};
+
+	for (const auto& [Begin, Size] : ReadableRanges)
+	{
+		for (std::size_t Offset = 0; Offset + 0x60 < Size; ++Offset)
+		{
+			Decoder Candidate;
+			if (!ParseScalarDecoder(Begin + Offset, Begin + Size, Candidate))
+				continue;
+			++ExtractedPrograms;
+			if (ValidateDecoder(Candidate))
+				ValidDecoders.push_back(std::move(Candidate));
+		}
+	}
+
 	for (const auto& [Begin, Size] : ReadableRanges)
 	{
 		for (std::size_t Offset = 0x80; Offset + 0x80 < Size; ++Offset)
@@ -769,40 +912,7 @@ void OffsetFinder::InitDiscoveryFFieldLayout()
 			if (Candidate.Instructions.empty() || Candidate.Instructions.size() > Discovery::FieldNameProgram.size())
 				continue;
 
-			Discovery::FieldNameOffset = Candidate.NameOffset;
-			Discovery::FieldNameInputRegister = Candidate.InputRegister;
-			Discovery::FieldNameProgramSize = static_cast<std::uint32_t>(Candidate.Instructions.size());
-			std::copy(Candidate.Instructions.begin(), Candidate.Instructions.end(), Discovery::FieldNameProgram.begin());
-			Discovery::FieldNameScalarXor = Candidate.ScalarXor;
-			Discovery::FieldNameScalarRotate = Candidate.ScalarRotate;
-
-			auto IsPlausibleName = [](const std::uint64_t Value)
-			{
-				return static_cast<std::uint32_t>(Value) > 0 && static_cast<std::uint32_t>(Value) < 0x04000000 && static_cast<std::uint32_t>(Value >> 32) < 0x00100000;
-			};
-			bool ValidatedAgainstKnownFields = false;
-			for (const int32_t HeadOffset : DiscoveryChildPropertiesCandidates)
-			{
-				const auto* GuidChild = *reinterpret_cast<const std::uint8_t* const*>(static_cast<const std::uint8_t*>(GuidObject.GetAddress()) + HeadOffset);
-				const auto* VectorChild = *reinterpret_cast<const std::uint8_t* const*>(static_cast<const std::uint8_t*>(VectorObject.GetAddress()) + HeadOffset);
-				const auto* ColorChild = *reinterpret_cast<const std::uint8_t* const*>(static_cast<const std::uint8_t*>(ColorObject.GetAddress()) + HeadOffset);
-				if (!GuidChild || !VectorChild || !ColorChild || Platform::IsBadReadPtr(GuidChild) || Platform::IsBadReadPtr(VectorChild) || Platform::IsBadReadPtr(ColorChild))
-					continue;
-				const std::uint64_t GuidRaw = Discovery::GetFieldName(GuidChild);
-				const std::uint64_t VectorRaw = Discovery::GetFieldName(VectorChild);
-				const std::uint64_t ColorRaw = Discovery::GetFieldName(ColorChild);
-				if (!IsPlausibleName(GuidRaw) || !IsPlausibleName(VectorRaw) || !IsPlausibleName(ColorRaw))
-					continue;
-				const std::string GuidName = FName(GuidRaw).ToString();
-				const std::string VectorName = FName(VectorRaw).ToString();
-				const std::string ColorName = FName(ColorRaw).ToString();
-				if ((GuidName == "A" || GuidName == "B" || GuidName == "C" || GuidName == "D") && (VectorName == "X" || VectorName == "Y" || VectorName == "Z") && (ColorName == "A" || ColorName == "B" || ColorName == "G" || ColorName == "R"))
-				{
-					ValidatedAgainstKnownFields = true;
-					break;
-				}
-			}
-			if (ValidatedAgainstKnownFields)
+			if (ValidateDecoder(Candidate))
 				ValidDecoders.push_back(std::move(Candidate));
 		}
 	}

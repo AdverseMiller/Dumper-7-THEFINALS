@@ -203,8 +203,8 @@ void StructManager::InitSizesAndIsFinal()
 		/* No need to check any other structs, as finding the LastMemberEnd only involves this struct */
 		Info.LastMemberEnd = LastMemberEnd;
 
-		if (NewOrExistingInfo.Size == 0 && LastMemberEnd > 0)
-			NewOrExistingInfo.Size = LastMemberEnd;
+		if (Info.Size == 0 && LastMemberEnd > 0)
+			Info.Size = LastMemberEnd;
 
 		if (!Super || ObjAsStruct.IsA(EClassCastFlags::Function))
 			continue;
