@@ -206,6 +206,9 @@ void StructManager::InitSizesAndIsFinal()
 		if (Info.Size == 0 && LastMemberEnd > 0)
 			Info.Size = LastMemberEnd;
 
+		if (NewOrExistingInfo.Size == 0 && LastMemberEnd > 0)
+			NewOrExistingInfo.Size = LastMemberEnd;
+
 		if (!Super || ObjAsStruct.IsA(EClassCastFlags::Function))
 			continue;
 
