@@ -759,9 +759,9 @@ namespace
 		Cursor = Dispatcher + LoadOffset + LoadLength;
 		while (Cursor < End && Result.Instructions.size() < Discovery::ProtectedSlotProgram.size())
 		{
-			if (*Cursor != 0x66)
+			if (*Cursor != 0x66 && *Cursor != 0xF2)
 				return false;
-			++Cursor;
+			const std::uint8_t Prefix = *Cursor++;
 			std::uint8_t Rex = 0;
 			if (Cursor < End && (*Cursor & 0xF0) == 0x40)
 				Rex = *Cursor++;
@@ -788,6 +788,18 @@ namespace
 			Discovery::ProtectedVectorInstruction Decoded{};
 			Decoded.Destination = Register;
 			Decoded.Source = Rm;
+
+			if (Prefix == 0xF2 && !ThreeByteOpcode && Opcode == 0x70 && Mode == 3)
+			{
+				if (Cursor >= End)
+					return false;
+				Decoded.Opcode = Discovery::ProtectedVectorOpcode::ShuffleLowWords;
+				Decoded.Immediate = *Cursor++;
+				Result.Instructions.push_back(Decoded);
+				continue;
+			}
+			if (Prefix != 0x66)
+				return false;
 
 			if (!ThreeByteOpcode && Opcode == 0x7E && (Rex & 0x8) && Mode == 3)
 			{

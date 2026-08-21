@@ -149,7 +149,7 @@ void Generator::WriteDiscoveryReport()
 	Report["generated_sdk"]["fproperty_protected_storage"] = "encoded members explicitly labeled";
 	Report["generated_sdk"]["ffield_class_flags"] = "omitted because decoder is not validated";
 
-	Report["object_array"]["strategy"] = "structural first-chunk reverse reference";
+	Report["object_array"]["strategy"] = Discovery::ChunkTableAddress ? "structural first-chunk reverse reference" : "independently validated sparse chunk allocations";
 	Report["object_array"]["global_cipher_used"] = false;
 	Report["object_array"]["stable_global_rva_available"] = false;
 	Report["object_array"]["chunk_table_runtime_address"] = Hex(Discovery::ChunkTableAddress);

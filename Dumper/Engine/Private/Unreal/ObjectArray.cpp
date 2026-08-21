@@ -7,6 +7,8 @@
 #include <array>
 #include <bit>
 #include <limits>
+#include <map>
+#include <set>
 #include <stdexcept>
 
 #include "Unreal/ObjectArray.h"
@@ -65,7 +67,7 @@ namespace
 	bool IsPlausibleObject(const std::uint8_t* Object, const std::uintptr_t ModuleBase, const std::uintptr_t ModuleEnd)
 	{
 		const std::uintptr_t ObjectAddress = reinterpret_cast<std::uintptr_t>(Object);
-		if (ObjectAddress < 0x10000 || (ObjectAddress & (alignof(void*) - 1)) != 0)
+		if (ObjectAddress < 0x10000 || ObjectAddress > 0x00007FFFFFFFFFFF || (ObjectAddress & (alignof(void*) - 1)) != 0)
 			return false;
 
 		const void* Vft = nullptr;
@@ -257,6 +259,9 @@ namespace
 		std::vector<std::uint8_t> Snapshot(ChunkSize);
 		for (std::size_t ChunkIndex = Chunks.size(); ChunkIndex-- > 0;)
 		{
+			if (!Chunks[ChunkIndex])
+				continue;
+
 			if (!TryReadMemory(Chunks[ChunkIndex], Snapshot.data(), Snapshot.size()))
 				continue;
 
@@ -416,6 +421,106 @@ namespace
 
 		std::cerr << std::format("Discovery bootstrap: scanned {:.1f} MiB while locating the chunk table\n", static_cast<double>(ScannedBytes) / 1048576.0);
 		return bFound;
+	}
+
+	bool FindStructuralChunksWithoutTable(std::uint8_t* ExpectedFirstChunk, const DiscoveredObjectArray& Layout, const std::uintptr_t ModuleBase, const std::uintptr_t ModuleEnd, DiscoveredObjectArray& Result)
+	{
+		constexpr std::array<std::uint32_t, 6> ElementCountCandidates = { 0x8000, 0x10000, 0x20000, 0x40000, 0x80000, 0x100000 };
+		constexpr std::size_t MaximumAllocationSlack = 0x80000;
+		constexpr std::uint32_t MaximumChunkCount = 0x400;
+
+		MEMORY_BASIC_INFORMATION FirstChunkMemory{};
+		if (!VirtualQuery(ExpectedFirstChunk, &FirstChunkMemory, sizeof(FirstChunkMemory)))
+			return false;
+
+		const std::uintptr_t FirstRegionEnd = reinterpret_cast<std::uintptr_t>(FirstChunkMemory.BaseAddress) + FirstChunkMemory.RegionSize;
+		const std::size_t FirstChunkAvailable = FirstRegionEnd - reinterpret_cast<std::uintptr_t>(ExpectedFirstChunk);
+		std::vector<std::uint32_t> MatchingElementCounts;
+		for (const std::uint32_t ElementsPerChunk : ElementCountCandidates)
+		{
+			const std::size_t ChunkBytes = static_cast<std::size_t>(ElementsPerChunk) * Layout.ItemSize;
+			if (ChunkBytes > FirstChunkAvailable || FirstChunkAvailable - ChunkBytes > MaximumAllocationSlack)
+				continue;
+			if (ScoreObjectChunk(ExpectedFirstChunk, 0, Layout.ItemSize, Layout.InternalIndexOffset, ElementsPerChunk, ModuleBase, ModuleEnd) >= 0)
+				MatchingElementCounts.push_back(ElementsPerChunk);
+		}
+
+		if (MatchingElementCounts.size() != 1)
+		{
+			std::cerr << std::format("Discovery bootstrap: allocation geometry matched {} element counts\n", MatchingElementCounts.size());
+			return false;
+		}
+
+		const std::uint32_t ElementsPerChunk = MatchingElementCounts[0];
+		const std::size_t ChunkBytes = static_cast<std::size_t>(ElementsPerChunk) * Layout.ItemSize;
+		std::map<std::uint32_t, std::set<std::uint8_t*>> Candidates;
+		Candidates[0].insert(ExpectedFirstChunk);
+
+		Platform::IterateMemoryRegionsWithCallback([&](void* Base, const std::size_t Size) -> bool
+		{
+			if (Size < ChunkBytes || Size > ChunkBytes + MaximumAllocationSlack)
+				return false;
+
+			auto* Region = static_cast<std::uint8_t*>(Base);
+			std::vector<std::uint8_t> Snapshot(Size);
+			if (!TryReadMemory(Region, Snapshot.data(), Snapshot.size()))
+				return false;
+
+			std::set<std::uint8_t*> AttemptedBases;
+			for (std::size_t Offset = 0; Offset + sizeof(void*) <= Snapshot.size(); Offset += sizeof(std::uint32_t))
+			{
+				std::uint8_t* Object = nullptr;
+				std::memcpy(&Object, Snapshot.data() + Offset, sizeof(Object));
+				if (!IsPlausibleObject(Object, ModuleBase, ModuleEnd))
+					continue;
+
+				std::int32_t InternalIndex = -1;
+				if (!TryReadValue(Object + Layout.InternalIndexOffset, InternalIndex) || InternalIndex < 0)
+					continue;
+
+				const std::uint32_t ChunkIndex = static_cast<std::uint32_t>(InternalIndex) / ElementsPerChunk;
+				const std::uint32_t InChunkIndex = static_cast<std::uint32_t>(InternalIndex) % ElementsPerChunk;
+				if (ChunkIndex >= MaximumChunkCount)
+					continue;
+
+				const std::size_t ItemOffset = static_cast<std::size_t>(InChunkIndex) * Layout.ItemSize;
+				if (Offset < ItemOffset)
+					continue;
+				auto* Candidate = Region + Offset - ItemOffset;
+				if (Candidate < Region || Candidate + ChunkBytes > Region + Size || !AttemptedBases.insert(Candidate).second)
+					continue;
+				if (ScoreObjectChunk(Candidate, ChunkIndex, Layout.ItemSize, Layout.InternalIndexOffset, ElementsPerChunk, ModuleBase, ModuleEnd) < 0)
+					continue;
+
+				Candidates[ChunkIndex].insert(Candidate);
+				break;
+			}
+
+			return false;
+		}, true);
+
+		if (Candidates.size() < 2 || !Candidates.contains(0) || Candidates[0].size() != 1 || *Candidates[0].begin() != ExpectedFirstChunk)
+			return false;
+
+		const std::uint32_t HighestChunkIndex = Candidates.rbegin()->first;
+		Result = Layout;
+		Result.Chunks.assign(static_cast<std::size_t>(HighestChunkIndex) + 1, nullptr);
+		Result.ElementsPerChunk = ElementsPerChunk;
+		Result.ChunkTableAddress = 0;
+		for (const auto& [ChunkIndex, Addresses] : Candidates)
+		{
+			if (Addresses.size() != 1)
+				return false;
+			Result.Chunks[ChunkIndex] = *Addresses.begin();
+		}
+
+		const std::int32_t HighestIndex = FindHighestLiveObjectIndex(Result.Chunks, ElementsPerChunk, Layout.ItemSize, Layout.InternalIndexOffset, ModuleBase, ModuleEnd);
+		if (HighestIndex < 0 || static_cast<std::uint32_t>(HighestIndex) / ElementsPerChunk != HighestChunkIndex)
+			return false;
+
+		Result.Num = HighestIndex + 1;
+		std::cerr << std::format("Discovery bootstrap: reconstructed {} logical chunks from {} independently validated allocations; {} chunks are currently empty\n", Result.Chunks.size(), Candidates.size(), Result.Chunks.size() - Candidates.size());
+		return true;
 	}
 }
 
@@ -638,7 +743,11 @@ void ObjectArray::InitDiscovery(const char* const ModuleName)
 		std::cerr << "Discovery bootstrap: locating reverse references to the first chunk\n";
 		DiscoveredObjectArray CompleteArray;
 		if (!FindStructuralChunkTable(DiscoveredArray.Chunks[0], DiscoveredArray, ModuleBase, ModuleEnd, CompleteArray))
-			throw std::runtime_error("The first object chunk was found, but no structurally valid chunk table referenced it");
+		{
+			std::cerr << "Discovery bootstrap: no plain chunk table found; locating chunk allocations independently\n";
+			if (!FindStructuralChunksWithoutTable(DiscoveredArray.Chunks[0], DiscoveredArray, ModuleBase, ModuleEnd, CompleteArray))
+				throw std::runtime_error("The first object chunk was found, but neither a chunk table nor an independently validated sparse chunk set could be reconstructed");
+		}
 
 		bUseDiscoveredChunks = true;
 		DiscoveredChunks = std::move(CompleteArray.Chunks);
@@ -978,6 +1087,8 @@ UEType ObjectArray::GetByIndex(int32 Index)
 
 		const std::uint32_t ChunkIndex = static_cast<std::uint32_t>(Index) / Discovery::ElementsPerChunk;
 		const std::uint32_t InChunkIndex = static_cast<std::uint32_t>(Index) % Discovery::ElementsPerChunk;
+		if (ChunkIndex >= DiscoveredChunks.size() || !DiscoveredChunks[ChunkIndex])
+			return UEType();
 		std::uint8_t* Item = DiscoveredChunks[ChunkIndex] + (InChunkIndex * SizeOfFUObjectItem);
 		return UEType(*reinterpret_cast<void**>(Item));
 	}

@@ -611,6 +611,15 @@ void OffsetFinder::InitDiscoveryFFieldLayout()
 
 		while (Cursor < RangeEnd && Result.Instructions.size() + 1 < Discovery::FieldNameProgram.size())
 		{
+			const std::uint8_t* ScalarMove = Cursor;
+			if (ScalarMove < RangeEnd && (*ScalarMove & 0xF0) == 0x40)
+				++ScalarMove;
+			if (ScalarMove + 2 <= RangeEnd && (*ScalarMove == 0x89 || *ScalarMove == 0x8B) && (ScalarMove[1] >> 6) == 3)
+			{
+				Cursor = ScalarMove + 2;
+				continue;
+			}
+
 			const std::uint8_t Prefix = *Cursor++;
 			if (Prefix != 0x66 && Prefix != 0xF2)
 				return false;

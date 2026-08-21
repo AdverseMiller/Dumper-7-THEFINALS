@@ -84,6 +84,45 @@ namespace
 		return false;
 	}
 
+	bool HasDiscoveryBuilderCursorSemantics(const uint8_t* Begin, const uint8_t* End, const DiscoveryRegisterAliases& Aliases)
+	{
+		bool HasCursorRead = false;
+		bool HasCursorStore = false;
+		bool HasCapacityRead = false;
+		for (const uint8_t* Instruction = Begin; Instruction + 4 <= End; ++Instruction)
+		{
+			const uint8_t* Cursor = Instruction;
+			uint8_t Rex = 0;
+			if ((*Cursor & 0xF0) == 0x40)
+				Rex = *Cursor++;
+			if (Cursor + 3 > End)
+				continue;
+
+			const uint8_t Opcode = Cursor[0];
+			if (Opcode != 0x8B && Opcode != 0x89 && Opcode != 0x39 && Opcode != 0x3B && Opcode != 0x8D)
+				continue;
+			const uint8_t ModRm = Cursor[1];
+			if ((ModRm & 0xC0) != 0x40 || (ModRm & 0x7) == 0x4)
+				continue;
+
+			const uint8_t Base = static_cast<uint8_t>((ModRm & 0x7) | ((Rex & 0x1) ? 0x8 : 0x0));
+			if (!Aliases.Builder[Base])
+				continue;
+			const std::int8_t Displacement = static_cast<std::int8_t>(Cursor[2]);
+			if (Displacement == 0x08)
+			{
+				HasCursorRead |= Opcode == 0x8B || Opcode == 0x3B || Opcode == 0x39 || Opcode == 0x8D;
+				HasCursorStore |= Opcode == 0x89;
+			}
+			else if (Displacement == 0x10)
+			{
+				HasCapacityRead |= Opcode == 0x8B || Opcode == 0x3B || Opcode == 0x39 || Opcode == 0x8D;
+			}
+		}
+
+		return HasCursorRead && HasCursorStore && HasCapacityRead;
+	}
+
 	bool DecodeNumberRead(const uint8_t* Instruction, const uint8_t* End, const DiscoveryRegisterAliases& Aliases, uint8_t& Destination, std::size_t& Length)
 	{
 		if (Instruction >= End)
@@ -113,11 +152,17 @@ namespace
 
 	bool IsTestOfRegister(const uint8_t* Instruction, const uint8_t* End, const uint8_t Register)
 	{
-		if (End - Instruction < 2 || Instruction[0] != 0x85 || (Instruction[1] & 0xC0) != 0xC0)
+		const uint8_t* Cursor = Instruction;
+		uint8_t Rex = 0;
+		if (Cursor < End && (*Cursor & 0xF0) == 0x40)
+			Rex = *Cursor++;
+		if (End - Cursor < 2 || Cursor[0] != 0x85 || (Cursor[1] & 0xC0) != 0xC0)
 			return false;
 
-		const uint8_t ModRm = Instruction[1];
-		return ((ModRm >> 3) & 0x7) == (Register & 0x7) && (ModRm & 0x7) == (Register & 0x7);
+		const uint8_t ModRm = Cursor[1];
+		const uint8_t Left = static_cast<uint8_t>(((ModRm >> 3) & 0x7) | ((Rex & 0x4) ? 0x8 : 0x0));
+		const uint8_t Right = static_cast<uint8_t>((ModRm & 0x7) | ((Rex & 0x1) ? 0x8 : 0x0));
+		return Left == Register && Right == Register;
 	}
 
 	bool HasDecrementOfRegister(const uint8_t* Begin, const uint8_t* End, const uint8_t Register)
@@ -158,7 +203,7 @@ namespace
 
 		DiscoveryRegisterAliases Aliases;
 		RecoverDiscoveryArgumentAliases(Begin, End, Aliases);
-		if (!HasDiscoveryBuilderReset(Begin, End, Aliases))
+		if (!HasDiscoveryBuilderReset(Begin, End, Aliases) && !HasDiscoveryBuilderCursorSemantics(Begin, End, Aliases))
 			return false;
 
 		const uint8_t* Underscore = nullptr;
@@ -211,6 +256,46 @@ namespace
 		return Rva < Function->EndAddress ? Function : nullptr;
 	}
 
+	const uint8_t* FindDiscoveryCallableEntry(const uint8_t* FunctionBegin, const uint8_t* FunctionEnd, const std::uintptr_t ModuleBase, const std::uintptr_t ModuleEnd)
+	{
+		const uint8_t* CandidateEnd = std::min(FunctionEnd, FunctionBegin + 0x10);
+		std::array<std::uint32_t, 0x10> References{};
+		Platform::IterateMemoryRegionsWithCallback([&](void* Base, const size_t Size) -> bool
+		{
+			const std::uintptr_t RegionStart = reinterpret_cast<std::uintptr_t>(Base);
+			const std::uintptr_t RegionEnd = RegionStart + Size;
+			const std::uintptr_t SearchStart = std::max(RegionStart, ModuleBase);
+			const std::uintptr_t SearchEnd = std::min(RegionEnd, ModuleEnd);
+			if (SearchEnd <= SearchStart || SearchEnd - SearchStart < 5)
+				return false;
+
+			std::vector<uint8_t> Snapshot(SearchEnd - SearchStart);
+			SIZE_T BytesRead = 0;
+			if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(SearchStart), Snapshot.data(), Snapshot.size(), &BytesRead) || BytesRead != Snapshot.size())
+				return false;
+
+			for (std::size_t Offset = 0; Offset + 5 <= Snapshot.size(); ++Offset)
+			{
+				if (Snapshot[Offset] != 0xE8)
+					continue;
+				std::int32_t Displacement = 0;
+				std::memcpy(&Displacement, Snapshot.data() + Offset + 1, sizeof(Displacement));
+				const std::uintptr_t Target = SearchStart + Offset + 5 + Displacement;
+				if (Target >= reinterpret_cast<std::uintptr_t>(FunctionBegin) && Target < reinterpret_cast<std::uintptr_t>(CandidateEnd))
+					++References[Target - reinterpret_cast<std::uintptr_t>(FunctionBegin)];
+			}
+
+			return false;
+		}, false);
+
+		const auto Best = std::max_element(References.begin(), References.begin() + (CandidateEnd - FunctionBegin));
+		if (Best == References.begin() + (CandidateEnd - FunctionBegin) || *Best == 0)
+			return FunctionBegin;
+		if (std::count(References.begin(), References.begin() + (CandidateEnd - FunctionBegin), *Best) != 1)
+			return FunctionBegin;
+		return FunctionBegin + std::distance(References.begin(), Best);
+	}
+
 	void* FindDiscoveryAppendString(const char* const ModuleName)
 	{
 		const std::uintptr_t ModuleBase = Platform::GetModuleBase(ModuleName);
@@ -257,7 +342,10 @@ namespace
 				const auto* FunctionBegin = reinterpret_cast<const uint8_t*>(ModuleBase + RuntimeFunction->BeginAddress);
 				const auto* FunctionEnd = reinterpret_cast<const uint8_t*>(ModuleBase + RuntimeFunction->EndAddress);
 				if (!Platform::IsBadReadPtr(FunctionBegin) && !Platform::IsBadReadPtr(FunctionEnd - 1) && IsDiscoveryAppendStringFunction(FunctionBegin, FunctionEnd))
-					Matches.insert(RuntimeFunction->BeginAddress);
+				{
+					const uint8_t* CallableEntry = FindDiscoveryCallableEntry(FunctionBegin, FunctionEnd, ModuleBase, ModuleEnd);
+					Matches.insert(static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(CallableEntry) - ModuleBase));
+				}
 			}
 
 			return false;
